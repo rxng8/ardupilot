@@ -68,7 +68,6 @@ class AutoTestHelicopter(AutoTestCopter):
         '''Test rotor runup'''
         # Takeoff and landing in Loiter
         TARGET_RUNUP_TIME = 10
-        self.zero_throttle()
         self.change_mode('LOITER')
         self.wait_ready_to_arm()
         self.arm_vehicle()
@@ -77,10 +76,10 @@ class AutoTestHelicopter(AutoTestCopter):
         coll = coll + 50
         self.set_parameter("H_RSC_RUNUP_TIME", TARGET_RUNUP_TIME)
         self.progress("Initiate Runup by putting some throttle")
+        tstart = self.get_sim_time()
         self.set_rc(8, 2000)
         self.set_rc(3, 1700)
         self.progress("Collective threshold PWM %u" % coll)
-        tstart = self.get_sim_time()
         self.progress("Wait that collective PWM pass threshold value")
         servo = self.assert_receive_message(
             "SERVO_OUTPUT_RAW",
@@ -98,7 +97,6 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("Runup time %u" % runup_time)
         self.zero_throttle()
         self.land_and_disarm()
-        self.mav.wait_heartbeat()
 
     # fly_avc_test - fly AVC mission
     def AVCMission(self):
@@ -143,12 +141,20 @@ class AutoTestHelicopter(AutoTestCopter):
         self.progress("AVC mission completed: passed!")
 
     def takeoff(self,
-                alt_min=30,
+                altitude_min=30,
                 takeoff_throttle=1700,
                 require_absolute=True,
                 mode="STABILIZE",
-                timeout=120):
-        """Takeoff get to 30m altitude."""
+                timeout=120,
+                altitude_max=None):
+        """Takeoff to at least altitude_min metres above home.
+
+        Beware: in a manual-collective mode such as STABILIZE the
+        vehicle can blow way past altitude_min before the collective is
+        reduced, and unless altitude_max is supplied nothing checks the
+        overshoot.  If your test cares about the altitude the takeoff
+        finishes at, take off in GUIDED.
+        """
         self.progress("TAKEOFF")
         self.change_mode(mode)
         if not self.armed():
@@ -171,10 +177,17 @@ class AutoTestHelicopter(AutoTestCopter):
         self.delay_sim_time(20, reason="rotor runup to complete")
 
         if mode == 'GUIDED':
-            self.user_takeoff(alt_min=alt_min)
+            max_err = 5
+            if altitude_max is not None:
+                max_err = altitude_max - altitude_min
+            self.user_takeoff(alt_min=altitude_min, max_err=max_err)
         else:
             self.set_rc(3, takeoff_throttle)
-        self.wait_altitude(alt_min-1, alt_min+5, relative=True, timeout=timeout)
+        if altitude_max is None:
+            # no limit; a finite stand-in as wait_and_maintain does
+            # arithmetic on the bounds
+            altitude_max = 100000
+        self.wait_altitude(altitude_min-1, altitude_max, relative=True, timeout=timeout)
         self.hover()
         self.progress("TAKEOFF COMPLETE")
 
@@ -196,16 +209,8 @@ class AutoTestHelicopter(AutoTestCopter):
                 self.progress("Actually, no I'm not - it is an external simulation")
                 continue
             model = frame_bits.get("model", frame)
-            # the model string for Callisto has crap in it.... we
-            # should really have another entry in the vehicleinfo data
-            # to carry the path to the JSON.
-            actual_model = model.split(":")[0]
-            defaults = self.model_defaults_filepath(actual_model)
-            if not isinstance(defaults, list):
-                defaults = [defaults]
             self.customise_SITL_commandline(
                 [],
-                defaults_filepath=defaults,
                 model=model,
                 wipe=True,
             )
@@ -216,7 +221,6 @@ class AutoTestHelicopter(AutoTestCopter):
         '''Test Heli Internal Throttle Curve and Governor'''
         self.customise_SITL_commandline(
             [],
-            defaults_filepath=self.model_defaults_filepath('heli-gas'),
             model="heli-gas",
             wipe=True,
         )

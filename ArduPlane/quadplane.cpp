@@ -599,7 +599,7 @@ static const struct AP_Param::defaults_table_struct defaults_table[] = {
     { "Q_LOIT_SPEED_MS",  5.0 },
     { "Q_WP_SPD",         5.0 },
     { "Q_WP_ACC",         1.0 },
-    { "Q_P_JERK_NE",      2   },
+    { "Q_P_NE_JERK",      2   },
     // lower rotational accel limits
     { "Q_A_ACC_R_MAX", 400 },
     { "Q_A_ACC_P_MAX", 400 },
@@ -2305,8 +2305,7 @@ void QuadPlane::PosControlState::set_state(enum position_control_state s)
             qp.thr_ctrl_land = false;
         } else if (s == QPOS_LAND_FINAL) {
             // remember last pos reset to handle GPS glitch in LAND_FINAL
-            Vector2f rpos;
-            ahrs_position_NE_reset_count = plane.ahrs.get_position_NE_reset_count(rpos);
+            ahrs_position_NE_reset_count = plane.ahrs.get_position_NE_reset_count();
             qp.landing_detect.land_start_ms = 0;
             qp.landing_detect.lower_limit_start_ms = 0;
         }
@@ -2631,7 +2630,11 @@ void QuadPlane::vtol_position_controller(void)
                 target_speed_ne_ms = diff_wp_norm * approach_speed_ms;
                 
                 // adjust target yaw angle into the apparent wind
-                const Vector2f wind_ms = plane.ahrs.wind_estimate().xy();
+                Vector3f wind_ned_ms;
+                // use the estimate even if it is not marked valid, to
+                // preserve existing behaviour
+                IGNORE_RETURN(plane.ahrs.get_wind(wind_ned_ms));
+                const Vector2f wind_ms = wind_ned_ms.xy();
                 const Vector2f airspeed_ne_ms = plane.ahrs.groundspeed_vector() - wind_ms;
                 if (airspeed_ne_ms.length_squared() < 1) {
                     // Don't cause unpredictable yaw swings if the airspeed vector
@@ -2761,8 +2764,7 @@ void QuadPlane::vtol_position_controller(void)
         } else {
             Vector2f zero;
             Vector2f vel_ne_ms = poscontrol.target_vel_ms.xy() + landing_velocity_ne_ms;
-            Vector2f rpos;
-            const uint16_t last_reset_count = plane.ahrs.get_position_NE_reset_count(rpos);
+            const uint16_t last_reset_count = plane.ahrs.get_position_NE_reset_count();
             /* we use velocity control when we may be touching the
               ground or if we've had a position reset from AHRS. This
               helps us handle a GPS glitch in the final land phase,
@@ -4041,10 +4043,33 @@ bool QuadPlane::using_wp_nav(void) const
  */
 MAV_TYPE QuadPlane::get_mav_type(void) const
 {
-    if (mav_type.get() == 0) {
+    if (!available()) {
+        // Not enabled, must be a normal plane
         return MAV_TYPE_FIXED_WING;
     }
-    return MAV_TYPE(mav_type.get());
+    if (mav_type.get() != 0) {
+        // Override parameter set by user
+        return MAV_TYPE(mav_type.get());
+    }
+    if (tiltrotor.enabled()) {
+        // Tiltrotor specific type
+        return MAV_TYPE_VTOL_TILTROTOR;
+    }
+    if (tailsitter.enabled()) {
+        // Tailsitter specific types
+        switch (motors->get_frame_mav_type()) {
+        case MAV_TYPE_VTOL_DUOROTOR:
+            return MAV_TYPE_VTOL_DUOROTOR;
+
+        case MAV_TYPE_QUADROTOR:
+            return MAV_TYPE_VTOL_QUADROTOR;
+
+        default:
+            break;
+        }
+    }
+    // Default to normal plane
+    return MAV_TYPE_FIXED_WING;
 }
 
 /*
@@ -4424,9 +4449,12 @@ float QuadPlane::get_land_airspeed_ms(void)
     
     // calculate speed based on landing desired velocity
     Vector2f vel_ne_ms = landing_desired_closing_velocity_NE_ms();
-    const Vector2f wind_ms = plane.ahrs.wind_estimate().xy();
+    Vector3f wind_ned_ms;
+    // use the estimate even if it is not marked valid, to preserve
+    // existing behaviour
+    IGNORE_RETURN(plane.ahrs.get_wind(wind_ned_ms));
     const float eas2tas = plane.ahrs.get_EAS2TAS();
-    vel_ne_ms -= wind_ms;
+    vel_ne_ms -= wind_ned_ms.xy();
     vel_ne_ms /= eas2tas;
     return vel_ne_ms.length();
 }

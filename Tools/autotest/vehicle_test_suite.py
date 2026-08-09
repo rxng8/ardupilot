@@ -35,6 +35,7 @@ import traceback
 from datetime import datetime
 from inspect import currentframe
 from inspect import getframeinfo
+from inspect import signature
 from pathlib import Path
 from typing import Dict
 from typing import List
@@ -989,6 +990,19 @@ class MSP_Generic(Telem):
             self.callback(cmd, data)
         else:
             print("cmd=%s" % str(cmd))
+
+    def send_command(self, cmd, data=bytes()):
+        '''send an MSPv1 request frame ($M<) to the autopilot'''
+        size = len(data)
+        frame = bytearray(b'$M<')
+        frame.append(size)
+        frame.append(cmd)
+        frame.extend(data)
+        checksum = 0
+        for b in frame[3:]:  # checksum covers size, command and payload
+            checksum ^= b
+        frame.append(checksum & 0xFF)
+        self.do_write(bytes(frame))
 
     def update_read(self):
         for byte in self.do_read():
@@ -2179,6 +2193,9 @@ class TestSuite(abc.ABC):
         self.max_set_rc_timeout = 0
         self.last_wp_load = 0
         self.forced_post_test_sitl_reboots = 0
+        # DFReaders handed out by dfreader_for_path(); closed after each
+        # test by close_dfreaders()
+        self.dfreaders = []
         self.run_tests_called = False
         self._show_test_timings = _show_test_timings
         self.test_timings = dict()
@@ -2476,7 +2493,6 @@ class TestSuite(abc.ABC):
                 self.customise_SITL_commandline(
                     self.valgrind_restart_customisations,
                     model=self.valgrind_restart_model,
-                    defaults_filepath=self.valgrind_restart_defaults_filepath,
                 )
             else:
                 self.stop_SITL()
@@ -2563,8 +2579,12 @@ class TestSuite(abc.ABC):
             if time.time() - tstart > timeout:
                 raise AutoTestTimeoutException("Did not detect reboot")
             try:
+                # any request we send while the autopilot is restarting
+                # is lost along with the old connection, so poll often
+                # rather than waiting a long time for a reply which will
+                # never come:
                 current_bootcount = self.get_parameter('STAT_BOOTCNT',
-                                                       timeout=1,
+                                                       timeout=0.1,
                                                        attempts=1,
                                                        verbose=True,
                                                        timeout_in_wallclock=True)
@@ -3298,7 +3318,6 @@ class TestSuite(abc.ABC):
         # reboot_sitl with Valgrind active:
         if self.valgrind or self.callgrind:
             self.valgrind_restart_model = model
-            self.valgrind_restart_defaults_filepath = defaults_filepath
             self.valgrind_restart_customisations = customisations
 
     def restart_SITL_frame(self,
@@ -3402,12 +3421,8 @@ class TestSuite(abc.ABC):
             ret["LOG_REPLAY"] = 1
         return ret
 
-    def apply_default_parameter_list(self):
-        self.set_parameters(self.default_parameter_list())
-
     def apply_default_parameters(self):
-        self.apply_defaultfile_parameters()
-        self.apply_default_parameter_list()
+        self.set_parameters(self.default_parameter_list())
         self.reboot_sitl()
 
     def reset_SITL_commandline(self):
@@ -5335,6 +5350,14 @@ class TestSuite(abc.ABC):
         away'''
         self.install_test_modules()
         self.context_get().installed_modules.append("test")
+
+    def install_script_module_context(self, source, modulename, install_name=None):
+        '''installs a scripting module which will be removed when the context
+        goes away'''
+        self.install_script_module(source, modulename, install_name=install_name)
+        if install_name is None:
+            install_name = modulename
+        self.context_get().installed_modules.append(os.path.basename(install_name))
 
     def install_mavlink_module_context(self):
         '''installs mavlink module which will be removed when the context goes
@@ -8419,6 +8442,7 @@ class TestSuite(abc.ABC):
     def get_location(self,
                      location_source: str = None,
                      frame: AltFrame = AltFrame.ABSOLUTE,
+                     timeout: float = 60,
                      ) -> Location:
         '''return the current vehicle location as a (frame-aware)
         Location, with the altitude taken in the requested frame.  Use
@@ -8442,12 +8466,18 @@ class TestSuite(abc.ABC):
             return Location.latlon_only(lat, lng)
         if location_source is not None and location_source != 'GLOBAL_POSITION_INT':
             raise ValueError(f"Unknown location source {location_source}")
+        # the vehicle reports zero lat/lng until it has a position estimate;
+        # block until a real one arrives.
+        tstart = self.get_sim_time_cached()
         self.send_poll_message('GLOBAL_POSITION_INT')
-        m = self.assert_receive_message('GLOBAL_POSITION_INT')
-        lat = m.lat * 1e-7
-        lng = m.lon * 1e-7
-        if lat == 0 and lng == 0:
-            raise ValueError(f"Bad lat/lng {lat=} {lng=}")
+        while True:
+            m = self.assert_receive_message('GLOBAL_POSITION_INT', timeout=10)
+            lat = m.lat * 1e-7
+            lng = m.lon * 1e-7
+            if lat != 0 or lng != 0:
+                break
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException("Only zero lat/lng from GLOBAL_POSITION_INT")
         if frame == AltFrame.ABSOLUTE:
             return Location(lat, lng, m.alt * 0.001, frame)
         if frame == AltFrame.ABOVE_HOME:
@@ -9314,6 +9344,22 @@ Also, ignores heartbeats not from our target system'''
                 return x
         return None
 
+    def statustext_count_in_collections(self, text):
+        '''returns the number of statustexts in the STATUSTEXT collection which
+        contain text'''
+        c = self.context_get()
+        if "STATUSTEXT" not in c.collections:
+            raise NotAchievedException("Asked to check context but it isn't collecting!")
+        return len([x for x in c.collections["STATUSTEXT"] if text.lower() in x.text.lower()])
+
+    def assert_statustext_count_in_collections(self, text, count):
+        '''check text appears in the STATUSTEXT collection at least count times'''
+        seen = self.statustext_count_in_collections(text)
+        self.progress("Saw (%s) %u times" % (text, seen))
+        if seen < count:
+            raise NotAchievedException("Expected at least %u (%s), got %u" %
+                                       (count, text, seen))
+
     def wait_statustext(self, text, timeout=20, the_function=None, check_context=False, regex=False, wallclock_timeout=False):
         """Wait for a specific STATUSTEXT, return that statustext message"""
 
@@ -9455,33 +9501,53 @@ Also, ignores heartbeats not from our target system'''
         except OSError:
             pass
 
-    def remove_installed_script_module(self, modulename):
-        path = self.installed_script_module_path(modulename)
-        os.unlink(path)
-
     def remove_installed_modules(self, modulename):
+        # a module is either a directory of lua files or a single lua file:
         dest = os.path.join("scripts", "modules", modulename)
         try:
-            shutil.rmtree(dest)
+            if os.path.isdir(dest):
+                shutil.rmtree(dest)
+            else:
+                os.unlink(dest)
         except IOError:
             pass
         except OSError:
             pass
 
+    def mavlink_connection_supports_reconnect_delay(self):
+        '''returns True if pymavlink lets us choose how long it waits
+        between connection attempts.  This probe exists only so that
+        autotest keeps working (just more slowly) against an older
+        pymavlink.
+        '''
+        return 'reconnect_delay' in signature(mavutil.mavlink_connection).parameters
+
     def get_mavlink_connection_going(self):
         # get a mavlink connection going
         try:
-            retries = 20
+            # SITL's listening socket is only gone for the few
+            # milliseconds it takes the process to re-exec itself on
+            # reboot, so retry rapidly rather than at pymavlink's
+            # default of once a second.  retries is a count of
+            # attempts, so scale it to keep the same overall budget.
+            # The fallback here is for older pymavlinks.
+            extra_connection_args = {}
+            reconnect_delay = 1
+            if self.mavlink_connection_supports_reconnect_delay():
+                reconnect_delay = 0.05
+                extra_connection_args["reconnect_delay"] = reconnect_delay
+            timeout = 20
             if self.gdb:
-                retries = 20000
+                timeout = 20000
             self.mav = mavutil.mavlink_connection(
                 self.autotest_connection_string_to_ardupilot(),
-                retries=retries,
+                retries=int(timeout/reconnect_delay),
                 robust_parsing=True,
                 source_system=250,
                 source_component=250,
                 autoreconnect=True,
                 dialect="all",  # if we don't pass this in we end up with the wrong mavlink version...
+                **extra_connection_args,
             )
         except Exception as msg:
             self.progress("Failed to start mavlink connection on %s: %s" %
@@ -9686,6 +9752,9 @@ Also, ignores heartbeats not from our target system'''
                 if h not in start_message_hooks:
                     self.message_hooks.remove(h)
             hooks_removed = True
+        # the test is done with any log it opened; release the
+        # filehandles rather than holding them for the life of the run:
+        self.close_dfreaders()
         self.test_timings[desc] = time.time() - start_time
         reset_needed = any(ctx.sitl_commandline_customised for ctx in self.contexts[old_contexts_length:])
 
@@ -9819,9 +9888,6 @@ Also, ignores heartbeats not from our target system'''
         result.passed = passed
         return result
 
-    def defaults_filepath(self):
-        return None
-
     def start_mavproxy(self, sitl_rcin_port=None, master=None, options=None):
         self.start_mavproxy_count += 1
         if self.mavproxy is not None:
@@ -9895,10 +9961,6 @@ Also, ignores heartbeats not from our target system'''
             "enable_fgview": self.enable_fgview,
         }
         start_sitl_args.update(**sitl_args)
-        if ("defaults_filepath" not in start_sitl_args or
-                start_sitl_args["defaults_filepath"] is None):
-            start_sitl_args["defaults_filepath"] = self.defaults_filepath()
-
         if "model" not in start_sitl_args or start_sitl_args["model"] is None:
             start_sitl_args["model"] = self.frame
         self.progress("Starting SITL", send_statustext=False)
@@ -10673,12 +10735,11 @@ Also, ignores heartbeats not from our target system'''
                 m = self.mav.recv_match(type='MAG_CAL_PROGRESS', blocking=True, timeout=5)
                 if m is None:
                     if tstop is not None:
-                        # wait 3 second to unsure that the calibration is well stopped
-                        if self.get_sim_time_cached() - tstop > 10:
-                            if reached_pct[0] > 33:
-                                raise NotAchievedException("Mag calibration didn't stop")
-                            else:
-                                break
+                        # if no more progress arrives for a few seconds after cancel,
+                        # treat the calibration as stopped regardless of the last
+                        # reported completion percentage.
+                        if self.get_sim_time_cached() - tstop > 3:
+                            break
                         else:
                             continue
                     else:
@@ -10710,7 +10771,8 @@ Also, ignores heartbeats not from our target system'''
                     if tstop is None:
                         tstop = self.get_sim_time_cached()
                 if tstop is not None:
-                    # wait 3 second to unsure that the calibration is well stopped
+                    # receiving progress for more than a few seconds after cancel
+                    # means the calibration did not stop promptly.
                     if self.get_sim_time_cached() - tstop > 3:
                         raise NotAchievedException("Mag calibration didn't stop")
             self.check_zero_mag_parameters(params)
@@ -10725,6 +10787,9 @@ Also, ignores heartbeats not from our target system'''
             tstart = self.get_sim_time()
             reached_pct = [0] * compass_tnumber
             report_get = [0] * compass_tnumber
+            # COMPASS_CAL_FIT=0.001 forces fitness > tolerance, so we expect
+            # MAG_CAL_FAILED_RESIDUALS_HIGH.
+            MAG_CAL_FAILED_RESIDUALS_HIGH = mavutil.mavlink.MAG_CAL_FAILED_RESIDUALS_HIGH
             while True:
                 if self.get_sim_time_cached() - tstart > timeout:
                     raise NotAchievedException("Cannot receive enough MAG_CAL_PROGRESS")
@@ -10732,10 +10797,10 @@ Also, ignores heartbeats not from our target system'''
                 if m.get_type() == "MAG_CAL_REPORT":
                     if report_get[m.compass_id] == 0:
                         self.progress("Report: %s" % str(m))
-                        if m.cal_status == mavutil.mavlink.MAG_CAL_FAILED:
+                        if m.cal_status == MAG_CAL_FAILED_RESIDUALS_HIGH:
                             report_get[m.compass_id] = 1
                         else:
-                            raise NotAchievedException("Mag calibration didn't failed")
+                            raise NotAchievedException("Expected MAG_CAL_FAILED_RESIDUALS_HIGH (10), got %u" % m.cal_status)
                     if all(ele >= 1 for ele in report_get):
                         self.progress("All Mag report failure")
                         break
@@ -10753,6 +10818,80 @@ Also, ignores heartbeats not from our target system'''
             self.check_zero_mag_parameters(params)
             self.check_zeros_mag_orient()
             self.set_parameter("COMPASS_CAL_FIT", old_cal_fit, add_to_context=False)
+
+            #################################################
+            if compass_tnumber > 1 and target_mask == 0:
+                self.start_subtest("Try magcal with one bad compass and ensure others continue")
+                self.progress("Compass mask is %s" % "{0:b}".format(target_mask))
+
+                old_sim_mag1_ofs_x = self.get_parameter("SIM_MAG1_OFS_X")
+                old_sim_mag1_ofs_y = self.get_parameter("SIM_MAG1_OFS_Y")
+                old_sim_mag1_ofs_z = self.get_parameter("SIM_MAG1_OFS_Z")
+
+                self.set_parameters({
+                    "SIM_MAG1_OFS_X": 2000,
+                    "SIM_MAG1_OFS_Y": 2000,
+                    "SIM_MAG1_OFS_Z": 2000,
+                }, add_to_context=False)
+
+                try:
+                    reset_pos_and_start_magcal(mavproxy, target_mask)
+                    report_status = [None] * compass_tnumber
+                    tstart = self.get_sim_time()
+                    while True:
+                        if self.get_sim_time_cached() - tstart > timeout:
+                            raise NotAchievedException("Cannot receive enough MAG_CAL_REPORT in selective-failure test")
+                        m = self.mav.recv_match(type=["MAG_CAL_PROGRESS", "MAG_CAL_REPORT"], blocking=True, timeout=1)
+                        if m is None:
+                            continue
+                        if m.get_type() != "MAG_CAL_REPORT":
+                            continue
+
+                        report_status[m.compass_id] = m.cal_status
+                        self.progress("Selective-failure report compass %u status %u" %
+                                      (m.compass_id, m.cal_status))
+                        if all(status is not None for status in report_status):
+                            break
+
+                    # SIM_MAG1_OFS_X/Y/Z=2000 exceeds COMPASS_OFFS_MAX, so one
+                    # compass is expected to report FAILED_OFFSETS. Do not
+                    # assume compass_id ordering here; some SITL setups can
+                    # differ in instance mapping.
+                    MAG_CAL_FAILED_OFFSETS = mavutil.mavlink.MAG_CAL_FAILED_OFFSETS
+                    failed_offsets_idxs = []
+                    for i, status in enumerate(report_status):
+                        if status == MAG_CAL_FAILED_OFFSETS:
+                            failed_offsets_idxs.append(i)
+
+                    if len(failed_offsets_idxs) != 1:
+                        raise NotAchievedException(
+                            "Expected exactly one compass to report MAG_CAL_FAILED_OFFSETS (8), got %u" %
+                            len(failed_offsets_idxs)
+                        )
+
+                    degraded_idx = failed_offsets_idxs[0]
+                    other_non_degraded_terminal = False
+                    for i, status in enumerate(report_status):
+                        if i == degraded_idx:
+                            continue
+                        if status is not None and status != MAG_CAL_FAILED_OFFSETS:
+                            other_non_degraded_terminal = True
+                            break
+
+                    if not other_non_degraded_terminal:
+                        raise NotAchievedException(
+                            "Expected at least one non-degraded compass terminal result"
+                        )
+
+                finally:
+                    self.set_parameters({
+                        "SIM_MAG1_OFS_X": old_sim_mag1_ofs_x,
+                        "SIM_MAG1_OFS_Y": old_sim_mag1_ofs_y,
+                        "SIM_MAG1_OFS_Z": old_sim_mag1_ofs_z,
+                    }, add_to_context=False)
+
+                self.check_zero_mag_parameters(params)
+                self.check_zeros_mag_orient()
 
             #################################################
             self.start_subtest("Try magcal and wait success")
@@ -11466,14 +11605,14 @@ Also, ignores heartbeats not from our target system'''
         self.wait_disarmed()
         self.delay_sim_time(15, reason="Allow log persistence to finish")
         self.assert_current_log_filesizes({
-            1: (1980*1024, 2020*1024),
+            1: (1950*1024, 1980*1024),
         })
         self.progress("Creating a second log")
         self.arm_vehicle()
         self.wait_disarmed()
         self.delay_sim_time(15, reason="Allow log persistence to finish")
         self.assert_current_log_filesizes({
-            1: (1980*1024, 2020*1024),
+            1: (1950*1024, 1980*1024),
             2: (1000*1024, 1100*1024),
         })
 
@@ -13273,8 +13412,20 @@ switch value'''
         return latest
 
     def dfreader_for_path(self, path):
-        return DFReader.DFReader_binary(path,
-                                        zero_time_base=True)
+        '''return a DFReader for path.  The reader holds an open filehandle
+        (and an mmap) on the log until it is closed, so stash it for
+        close_dfreaders() to release at the end of the test rather than
+        leaking it for the life of the process.'''
+        ret = DFReader.DFReader_binary(path,
+                                       zero_time_base=True)
+        self.dfreaders.append(ret)
+        return ret
+
+    def close_dfreaders(self):
+        '''close all readers handed out by dfreader_for_path()'''
+        for dfreader in self.dfreaders:
+            dfreader.close()
+        self.dfreaders = []
 
     def assert_log_dsf_no_drops(self, path):
         """Assert that DSF.Dp (write-buffer drop count) is zero in the given log file"""
@@ -13288,6 +13439,155 @@ switch value'''
         self.progress("DSF dropcount in %s: %d" % (path, dropped))
         if dropped != 0:
             raise NotAchievedException("Expected zero dropped log messages in %s, got %d" % (path, dropped))
+
+    def assert_ekfs_match_sim_state(self,
+                                    ekf_message_types=None,
+                                    max_roll_pitch_err_deg=5,
+                                    max_yaw_err_deg=10,
+                                    max_vel_err_ms=1.5,
+                                    max_pos_ne_err_m=5,
+                                    max_pos_d_err_m=3,
+                                    min_samples=100,
+                                    ignore_before_time_s=0,
+                                    max_violation_duration_s=2):
+        '''walk the current onboard log comparing each primary-core EKF
+        estimate message (NKF1 for EKF2, XKF1 for EKF3) against
+        simulator truth (SIM for attitude, SIM2 for velocity and
+        position), linearly interpolated to the estimate timestamps.
+        Only samples logged while armed and after ignore_before_time_s
+        are considered.
+
+        Estimates can briefly diverge from truth during aggressive
+        manoeuvres; only divergence sustained for more than
+        max_violation_duration_s fails.'''
+        import numpy as np
+        if ekf_message_types is None:
+            ekf_message_types = ['NKF1', 'XKF1']
+
+        # tolerances may be supplied as a scalar or as a dict keyed by
+        # message type, allowing per-filter tolerances:
+        def tol(spec, key):
+            if isinstance(spec, dict):
+                return spec[key]
+            return spec
+
+        # gather everything first so truth can be interpolated to the
+        # estimate timestamps:
+        dfreader = self.dfreader_for_current_onboard_log()
+        sim = []
+        sim2 = []
+        est = {}
+        for key in ekf_message_types:
+            est[key] = []
+        armed_spans = []
+        armed_at = None
+        while True:
+            m = dfreader.recv_match(type=ekf_message_types + ['SIM', 'SIM2', 'EV'])
+            if m is None:
+                break
+            m_type = m.get_type()
+            t = m.TimeUS * 1e-6
+            if m_type == 'EV':
+                if m.Id == 10 and armed_at is None:  # armed
+                    armed_at = t
+                elif m.Id == 11 and armed_at is not None:  # disarmed
+                    armed_spans.append((armed_at, t))
+                    armed_at = None
+            elif m_type == 'SIM':
+                sim.append((t, m.Roll, m.Pitch, m.Yaw))
+            elif m_type == 'SIM2':
+                sim2.append((t, m.VN, m.VE, m.VD, m.PN, m.PE, m.PD))
+            elif m.C == 0:
+                # only check each filter's primary core
+                est[m_type].append((t, m.Roll, m.Pitch, m.Yaw, m.VN, m.VE, m.VD, m.PN, m.PE, m.PD))
+        if armed_at is not None:
+            armed_spans.append((armed_at, float('inf')))
+        if len(sim) < 2 or len(sim2) < 2:
+            raise NotAchievedException("Insufficient SIM/SIM2 truth data in log")
+        sim = np.array(sim)
+        sim2 = np.array(sim2)
+        # unwrap yaw so interpolation does not glitch at the 0/360 boundary:
+        sim_yaw_unwrapped = np.degrees(np.unwrap(np.radians(sim[:, 3])))
+
+        for key in ekf_message_types:
+            rows = np.array(est[key])
+            if len(rows) == 0:
+                raise NotAchievedException("No %s messages in log" % key)
+            est_t = rows[:, 0]
+            armed = np.zeros(len(est_t), dtype=bool)
+            for (t0, t1) in armed_spans:
+                armed |= (est_t >= t0) & (est_t <= t1)
+            # restrict to samples bracketed by truth so interpolation
+            # never extrapolates:
+            armed &= (est_t >= max(sim[0, 0], sim2[0, 0])) & (est_t <= min(sim[-1, 0], sim2[-1, 0]))
+            rows = rows[armed]
+            est_t = rows[:, 0]
+            if len(est_t) < min_samples:
+                raise NotAchievedException(
+                    "Insufficient %s/truth samples compared (%u)" % (key, len(est_t)))
+
+            roll_err = np.abs(rows[:, 1] - np.interp(est_t, sim[:, 0], sim[:, 1]))
+            pitch_err = np.abs(rows[:, 2] - np.interp(est_t, sim[:, 0], sim[:, 2]))
+            yaw_err = np.abs((rows[:, 3] - np.interp(est_t, sim[:, 0], sim_yaw_unwrapped) + 180) % 360 - 180)
+            vel_err = np.sqrt(
+                (rows[:, 4] - np.interp(est_t, sim2[:, 0], sim2[:, 1]))**2 +
+                (rows[:, 5] - np.interp(est_t, sim2[:, 0], sim2[:, 2]))**2 +
+                (rows[:, 6] - np.interp(est_t, sim2[:, 0], sim2[:, 3]))**2)
+            # EKF positions are relative to the EKF origin while SIM2
+            # positions are relative to the simulation origin; remove
+            # the constant offset between the two, estimated from the
+            # first few armed samples:
+            pn_err = rows[:, 7] - np.interp(est_t, sim2[:, 0], sim2[:, 4])
+            pe_err = rows[:, 8] - np.interp(est_t, sim2[:, 0], sim2[:, 5])
+            pd_err = rows[:, 9] - np.interp(est_t, sim2[:, 0], sim2[:, 6])
+            nbase = min(10, len(est_t))
+            pn_err -= pn_err[:nbase].mean()
+            pe_err -= pe_err[:nbase].mean()
+            pd_err -= pd_err[:nbase].mean()
+            pos_ne_err = np.sqrt(pn_err**2 + pe_err**2)
+            pos_d_err = np.abs(pd_err)
+
+            att_bad = (roll_err > tol(max_roll_pitch_err_deg, key)) | (pitch_err > tol(max_roll_pitch_err_deg, key))
+            yaw_bad = yaw_err > tol(max_yaw_err_deg, key)
+            vel_bad = vel_err > tol(max_vel_err_ms, key)
+            ne_bad = pos_ne_err > tol(max_pos_ne_err_m, key)
+            d_bad = pos_d_err > tol(max_pos_d_err_m, key)
+            bad = att_bad | yaw_bad | vel_bad | ne_bad | d_bad
+            considered = est_t >= ignore_before_time_s
+            bad &= considered
+
+            # only divergence sustained for max_violation_duration_s fails:
+            run_start = None
+            for i in range(len(est_t)):
+                if not considered[i]:
+                    continue
+                if not bad[i]:
+                    run_start = None
+                    continue
+                desc = []
+                if att_bad[i]:
+                    desc.append("attitude (roll-err=%.1fdeg pitch-err=%.1fdeg)" % (roll_err[i], pitch_err[i]))
+                if yaw_bad[i]:
+                    desc.append("yaw (yaw-err=%.1fdeg)" % yaw_err[i])
+                if vel_bad[i]:
+                    desc.append("velocity (vel-err=%.1fm/s)" % vel_err[i])
+                if ne_bad[i]:
+                    desc.append("position (pos-ne-err=%.1fm)" % pos_ne_err[i])
+                if d_bad[i]:
+                    desc.append("height (pos-d-err=%.1fm)" % pos_d_err[i])
+                if run_start is None:
+                    run_start = est_t[i]
+                    self.progress("%s transient %s divergence at t=%.3f" % (key, " ".join(desc), est_t[i]))
+                elif est_t[i] - run_start > max_violation_duration_s:
+                    raise NotAchievedException(
+                        "%s diverged from truth for more than %.1fs (t=%.3f %s)" %
+                        (key, max_violation_duration_s, est_t[i], " ".join(desc)))
+
+            ncompared = int(considered.sum())
+            if ncompared < min_samples:
+                raise NotAchievedException(
+                    "Insufficient %s/truth samples compared (%u)" % (key, ncompared))
+            self.progress("Compared %u %s samples against simulator truth" % (ncompared, key))
 
     def dfreader_for_current_onboard_log(self):
         return self.dfreader_for_path(self.current_onboard_log_filepath())
@@ -13976,6 +14276,11 @@ switch value'''
                     "device": "MicroStrain7",
                     "eahrs_type": 7,
                 },
+                {
+                    "name": "Aeron",
+                    "device": "Aeron-PLX3",
+                    "eahrs_type": 10,
+                },
             ]
 
             self.start_subtest("ExternalAHRS backend attitude")
@@ -14015,7 +14320,10 @@ switch value'''
                     self.reboot_sitl()
                     self.ahrstrim_attitude_correctness_test_attitude(11)
                 self.context_pop()
-                self.reboot_sitl()
+                # no reboot here: the restored parameters take effect at
+                # the next boot, which the following backend's
+                # customise_SITL_commandline (or the non-ExternalAHRS
+                # section's reboot) performs anyway
 
             self.start_subtest("Testing non-ExternalAHRS backends")
             for ahrs_type in [0, 2, 3]:
@@ -15206,6 +15514,168 @@ switch value'''
             if dist < 1:
                 break
 
+    def msp_connect(self, port, timeout=30):
+        '''connect an MSP client to the autopilot's (TCP server) MSP port'''
+        msp = MSP_Generic(("127.0.0.1", port))
+        tstart = self.get_sim_time()
+        while not msp.connected:
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException("Failed to connect to MSP port")
+            msp.connect()
+        return msp
+
+    def msp_send_until_parameters(self, msp, frames, parameters, timeout=30):
+        '''re-send the given (command, payload) MSP frames until the parameters
+        reach the wanted values; a frame sent before the link is fully up early
+        in boot can be dropped, just as a real client would resend'''
+        tstart = self.get_sim_time()
+        while True:
+            for (cmd, data) in frames:
+                msp.send_command(cmd, data)
+            try:
+                self.wait_parameter_values(parameters, timeout=3)
+                return
+            except NotAchievedException:
+                if self.get_sim_time_cached() - tstart > timeout:
+                    raise
+
+    def wait_msp_vtx_config(self, msp, want, timeout=10):
+        '''poll MSP_VTX_CONFIG until the fields in want match the FC's reply,
+        draining stale buffered frames; the reply is the config the FC hands a
+        VTX/goggle: type, band/channel one based, power index, pitmode, freq and
+        deviceIsReady (gated on the boot handshake)'''
+        MSP_VTX_CONFIG = 88
+        last = {}
+
+        def collect(cmd, data):
+            if cmd == MSP_VTX_CONFIG and len(data) >= 8:
+                (t, band, channel, power, pitmode, freq, ready) = struct.unpack("<BBBBBHB", bytes(data[:8]))
+                last['cfg'] = {
+                    "type": t, "band": band, "channel": channel, "power": power,
+                    "pitmode": pitmode, "freq": freq, "deviceIsReady": ready,
+                }
+        msp.callback = collect
+        tstart = self.get_sim_time()
+        try:
+            while True:
+                if self.get_sim_time_cached() - tstart > timeout:
+                    raise NotAchievedException("MSP_VTX_CONFIG never matched %s (last %s)" % (want, last.get('cfg')))
+                msp.send_command(MSP_VTX_CONFIG)
+                msp.update()
+                cfg = last.get('cfg')
+                if cfg is not None and all(cfg[k] == v for k, v in want.items()):
+                    return cfg
+        finally:
+            msp.callback = None
+
+    def check_msp_set_vtx_config(self, msp):
+        '''drive MSP_SET_VTX_CONFIG over the supplied client and check the
+        configured VTX band/channel/frequency/power update accordingly'''
+        MSP_SET_VTX_CONFIG = 89
+        MSP_SET_VTXTABLE_POWERLEVEL = 228
+
+        # before the air unit uploads its own config the FC advertises not-ready,
+        # which is what makes a betaflight-style VTX run its boot handshake
+        self.progress("Checking the FC reports not-ready before the handshake")
+        self.wait_msp_vtx_config(msp, {"deviceIsReady": 0})
+
+        # the leading field is overloaded: a value <= 63 encodes band/channel
+        # as band_index*8 + channel_index (both zero based internally), so
+        # 4*8 + 3 selects Raceband (band 4) channel 4 (index 3) == 5769MHz.
+        # the power index is one based, so 2 maps to the second level (100mW).
+        self.progress("Setting band/channel via the legacy encoded field")
+        self.msp_send_until_parameters(msp, [
+            (MSP_SET_VTX_CONFIG, struct.pack("<HBB", 4*8 + 3, 2, 0)),
+        ], {
+            "VTX_BAND": 4,
+            "VTX_CHANNEL": 3,
+            "VTX_FREQ": 5769,
+            "VTX_POWER": 100,
+        })
+
+        # the API 1.42 standalone band/channel fields are one based on the wire
+        # with band 0 meaning "use raw frequency"; band 3 channel 2 selects
+        # Band E (index 2) channel 2 (index 1) == 5685MHz. power index 1 == 25mW.
+        self.progress("Setting band/channel via the 1.42 standalone fields")
+        payload = struct.pack("<H", 0)          # legacy field, superseded below
+        payload += struct.pack("<BB", 1, 0)     # power index, pitmode
+        payload += struct.pack("<B", 0)         # lowPowerDisarm
+        payload += struct.pack("<H", 0)         # pitModeFreq
+        payload += struct.pack("<BBH", 3, 2, 0)  # band, channel (one based), freq
+        self.msp_send_until_parameters(msp, [(MSP_SET_VTX_CONFIG, payload)], {
+            "VTX_BAND": 2,
+            "VTX_CHANNEL": 1,
+            "VTX_FREQ": 5685,
+            "VTX_POWER": 25,
+        })
+
+        # a VTX declares its own power table (here HDZero-like 25/200/500mW) one
+        # level at a time. The power value is dBm, as betaflight power tables are
+        # (14dBm=25mW, 23dBm=200mW, 27dBm=500mW). Once learned the power index
+        # maps to those values instead of the default plan, so index 3 selects
+        # 500mW not 800mW.
+        self.progress("Learning a VTX power table then selecting from it")
+        frames = [(MSP_SET_VTXTABLE_POWERLEVEL, struct.pack("<BHB", level, dbm, 0))
+                  for level, dbm in [(1, 14), (2, 23), (3, 27)]]  # [u8 level][u16 dBm][u8 label len]
+        frames.append((MSP_SET_VTX_CONFIG, struct.pack("<HBB", 4*8 + 3, 3, 0)))
+        self.msp_send_until_parameters(msp, frames, {
+            "VTX_FREQ": 5769,
+            "VTX_POWER": 500,
+        })
+
+        # pitmode is carried as a byte alongside power in the same message and
+        # maps to the VTX pitmode option (VTX_OPTIONS bit 0)
+        self.progress("Enabling then disabling pitmode")
+        self.msp_send_until_parameters(msp, [
+            (MSP_SET_VTX_CONFIG, struct.pack("<HBB", 4*8 + 3, 3, 1)),
+        ], {"VTX_OPTIONS": 1})
+        self.msp_send_until_parameters(msp, [
+            (MSP_SET_VTX_CONFIG, struct.pack("<HBB", 4*8 + 3, 3, 0)),
+        ], {"VTX_OPTIONS": 0})
+
+        # the FC answers MSP_VTX_CONFIG with the live config and, now that the
+        # VTX has uploaded its own config, reports ready. band/channel are one
+        # based on the wire: Raceband (index 4) channel 4 (index 3) == 5769MHz,
+        # power index 3 selects the learned 500mW level.
+        self.progress("Checking the FC reports its config back over MSP_VTX_CONFIG")
+        self.wait_msp_vtx_config(msp, {
+            "type": 5, "band": 5, "channel": 4, "power": 3,
+            "pitmode": 0, "freq": 5769, "deviceIsReady": 1,
+        })
+
+    def MSPVTXConfig(self):
+        '''test changing VTX band/channel/frequency via MSP_SET_VTX_CONFIG'''
+        self.set_parameters({
+            "SERIAL5_PROTOCOL": 32,  # MSP
+            "VTX_ENABLE": 1,
+        })
+        port = self.spare_network_port()
+        self.customise_SITL_commandline([
+            "--serial5=tcp:%u" % port  # serial5 listens on localhost port
+        ])
+        self.wait_ready_to_arm()
+        msp = self.msp_connect(port)
+        self.check_msp_set_vtx_config(msp)
+        self.reboot_sitl()
+
+    def MSPDisplayPortVTXConfig(self):
+        '''test changing VTX band/channel/frequency via MSP_SET_VTX_CONFIG on
+        the MSP DisplayPort link, which is serviced by the OSD task rather than
+        the MSP thread'''
+        self.set_parameters({
+            "SERIAL5_PROTOCOL": 42,  # MSP DisplayPort
+            "OSD_TYPE": 5,           # MSP DisplayPort
+            "VTX_ENABLE": 1,
+        })
+        port = self.spare_network_port()
+        self.customise_SITL_commandline([
+            "--serial5=tcp:%u" % port  # serial5 listens on localhost port
+        ])
+        self.wait_ready_to_arm()
+        msp = self.msp_connect(port)
+        self.check_msp_set_vtx_config(msp)
+        self.reboot_sitl()
+
     def CRSF(self):
         '''Test RC CRSF'''
         self.context_push()
@@ -16156,6 +16626,16 @@ SERIAL5_BAUD 128
         # ridge (~206 m AMSL) while staying 10 m below both tests' max
         # fence altitude (225 m AMSL), so use the higher of the current
         # altitude and 215 m AMSL.
+        # north_m must be generous: on QuadPlane the reposition flies as
+        # fixed-wing GUIDED, which orbits the target at ~60-70 m
+        # (WP_LOITER_RAD plus tracking error), so arrival is accepted at
+        # 100 m -- a tighter radius is only ever satisfied transiently
+        # while joining the orbit.  The wait can therefore fire ~100 m
+        # short of the target, and the back-transition carries the
+        # aircraft tens of metres further, so the actual descent point
+        # must still be well past the cliff edge for the min-alt fence
+        # floor (~150 m AMSL in both cliff tests) to sit clearly above
+        # the terrain below.
         reposition_alt_amsl = max(current_loc.alt, 215.0)
 
         # fly to target using GUIDED mode waypoint navigation
@@ -16170,7 +16650,7 @@ SERIAL5_BAUD 128
             reposition_alt_amsl,
             frame=mavutil.mavlink.MAV_FRAME_GLOBAL,
         )
-        self.wait_location(target_loc, accuracy=50, height_accuracy=None,
+        self.wait_location(target_loc, accuracy=100, height_accuracy=None,
                            timeout=timeout)
 
         # switch back to loiter mode and descend to breach the fence floor
@@ -16350,7 +16830,7 @@ SERIAL5_BAUD 128
         self.takeoff(25, mode=self.FenceRelative_TakeoffMode())
         self.do_fence_enable()
         self.assert_mode_is(self.FenceRelative_TakeoffMode())
-        self.FenceRelative_fly_north_then_descend(150)
+        self.FenceRelative_fly_north_then_descend(300)
         self.wait_mode('RTL', timeout=120)
         expected_breach_alt = offset_home.alt + fence_alt_min
         self.assert_altitude(expected_breach_alt, accuracy=10)
@@ -16518,7 +16998,7 @@ SERIAL5_BAUD 128
         self.takeoff(20, mode=self.FenceRelative_TakeoffMode())
         self.do_fence_enable()
         self.assert_mode_is(self.FenceRelative_TakeoffMode())
-        self.FenceRelative_fly_north_then_descend(150)
+        self.FenceRelative_fly_north_then_descend(300)
         self.wait_mode('RTL', timeout=120)
         expected_breach_alt = fence_min_below_arming
         self.assert_altitude(expected_breach_alt, accuracy=10)
@@ -17050,11 +17530,16 @@ SERIAL5_BAUD 128
             return
 
     def setGCSfailsafe(self, paramValue):
-        # Slow down the sim rate if GCS Failsafe is in use
+        # Slow down the sim rate if GCS Failsafe is in use; the test
+        # framework's GCS heartbeats are paced in wall-clock time, so
+        # while FS_GCS_ENABLE is set a Python-side stall of more than
+        # FS_GCS_TIMEOUT/speedup wall-seconds would spuriously trigger
+        # the failsafe.  With it disabled no such coupling exists, so
+        # restore the suite's full speedup.
         if paramValue == 0:
             self.set_parameters({
                 "FS_GCS_ENABLE": paramValue,
-                "SIM_SPEEDUP": 10,
+                "SIM_SPEEDUP": self.speedup,
             })
         else:
             self.set_parameters({

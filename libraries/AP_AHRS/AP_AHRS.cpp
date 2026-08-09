@@ -564,46 +564,20 @@ void AP_AHRS::try_set_common_origin(const AP_AHRS_Backend &source_backend, const
 void AP_AHRS::update_reset_counters()
 {
     if (state.active_EKF_type != last_active_ekf_type) {
-        const auto *last = estimates_for_type(last_active_ekf_type);
-
-        // deltas across the estimator change come from differencing
-        // old and new backend estimates; zero if either side invalid
-        float yaw_delta = 0;
-        Vector2f pos_ne_delta;
-        float pos_d_delta = 0;
-        if (last != nullptr) {
-            if (active_estimates->attitude_valid && last->attitude_valid) {
-                yaw_delta = wrap_PI(active_estimates->yaw_rad - last->yaw_rad);
-            }
-            if (active_estimates->position_NE_valid && last->position_NE_valid) {
-                pos_ne_delta = (active_estimates->position_NE - last->position_NE).tofloat();
-            }
-            if (active_estimates->position_D_valid && last->position_D_valid) {
-                pos_d_delta = active_estimates->position_D - last->position_D;
-            }
-        }
-
-        attitude_reset_count++;
-        active_estimates_attitude_reset_count = active_estimates->attitude_reset_count;
-        yaw_reset_tracker.fill(active_estimates->yaw_reset_count, yaw_delta);
-        position_NE_reset_tracker.fill(active_estimates->position_NE_reset_count, pos_ne_delta);
-        position_D_reset_tracker.fill(active_estimates->position_D_reset_count, pos_d_delta);
+        attitude_reset_tracker.fill(active_estimates->attitude_reset_count);
+        yaw_reset_tracker.fill(active_estimates->yaw_reset_count);
+        position_NE_reset_tracker.fill(active_estimates->position_NE_reset_count);
+        position_D_reset_tracker.fill(active_estimates->position_D_reset_count);
         LOGGER_WRITE_EVENT(LogEvent::EKF_YAW_RESET);
         return;
     }
 
-    if (active_estimates_attitude_reset_count != active_estimates->attitude_reset_count) {
-        active_estimates_attitude_reset_count = active_estimates->attitude_reset_count;
-        attitude_reset_count++;
-    }
-    if (yaw_reset_tracker.update(active_estimates->yaw_reset_count,
-                                 active_estimates->yaw_reset_delta)) {
+    attitude_reset_tracker.update(active_estimates->attitude_reset_count);
+    if (yaw_reset_tracker.update(active_estimates->yaw_reset_count)) {
         LOGGER_WRITE_EVENT(LogEvent::EKF_YAW_RESET);
     }
-    position_NE_reset_tracker.update(active_estimates->position_NE_reset_count,
-                                     active_estimates->position_NE_reset_delta);
-    position_D_reset_tracker.update(active_estimates->position_D_reset_count,
-                                    active_estimates->position_D_reset_delta);
+    position_NE_reset_tracker.update(active_estimates->position_NE_reset_count);
+    position_D_reset_tracker.update(active_estimates->position_D_reset_count);
 }
 
 // update run at loop rate
@@ -772,7 +746,7 @@ float AP_AHRS::get_error_yaw(void) const
 float AP_AHRS::wind_alignment(const float heading_deg) const
 {
     Vector3f wind;
-    if (!wind_estimate(wind)) {
+    if (!get_wind(wind)) {
         return 0;
     }
     const float wind_heading_rad = atan2f(-wind.y, -wind.x);
@@ -784,8 +758,12 @@ float AP_AHRS::wind_alignment(const float heading_deg) const
  */
 float AP_AHRS::head_wind(void) const
 {
+    Vector3f wind;
+    // wind_alignment() has already returned zero if we have no valid
+    // estimate, so the validity of the wind vector is not checked here
+    IGNORE_RETURN(get_wind(wind));
     const float alignment = wind_alignment(get_yaw_deg());
-    return alignment * wind_estimate().xy().length();
+    return alignment * wind.xy().length();
 }
 
 /*
@@ -1720,21 +1698,6 @@ void AP_AHRS::writeTerrainAMSL(float alt_amsl_m)
 #endif
 }
 
-/*
-  get gain factor for Z controllers
- */
-float AP_AHRS::getControlScaleZ(void) const
-{
-#if AP_AHRS_DCM_ENABLED
-    if (active_EKF_type() == EKFType::DCM) {
-        // when flying on DCM lower gains by 4x to cope with the high
-        // lag
-        return 0.25;
-    }
-#endif
-    return 1;
-}
-
 // get compass offset estimates
 // true if offsets are valid
 bool AP_AHRS::getMagOffsets(uint8_t mag_idx, Vector3f &magOffsets) const
@@ -2042,10 +2005,7 @@ bool AP_AHRS::set_home(const Location &loc)
 
 #if AP_MISSION_ENABLED
     // Save home to mission
-    AP_Mission *mission = AP::mission();
-    if (mission != nullptr) {
-        mission->write_home_to_storage();
-    }
+    AP::mission().write_home_to_storage();
 #endif
 
     return true;
@@ -2063,41 +2023,6 @@ void AP_AHRS::load_watchdog_home()
         _home_locked = true;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Restored watchdog home");
     }
-}
-
-// get_hgt_ctrl_limit - get maximum height to be observed by the control loops in metres and a validity flag
-// this is used to limit height during optical flow navigation
-// it will return false when no limiting is required
-bool AP_AHRS::get_hgt_ctrl_limit(float& limit) const
-{
-    switch (active_EKF_type()) {
-#if AP_AHRS_DCM_ENABLED
-    case EKFType::DCM:
-        // We are not using an EKF so no limiting applies
-        return false;
-#endif
-
-#if HAL_NAVEKF2_AVAILABLE
-    case EKFType::TWO:
-        return ekf2.EKF2.getHeightControlLimit(limit);
-#endif
-
-#if HAL_NAVEKF3_AVAILABLE
-    case EKFType::THREE:
-        return ekf3.EKF3.getHeightControlLimit(limit);
-#endif
-
-#if AP_AHRS_SIM_ENABLED
-    case EKFType::SIM:
-        return false;
-#endif
-#if AP_AHRS_EXTERNAL_ENABLED
-    case EKFType::EXTERNAL:
-        return false;
-#endif
-    }
-
-    return false;
 }
 
 // Set to true if the terrain underneath is stable enough to be used as a height reference
@@ -2128,31 +2053,6 @@ void AP_AHRS::set_terrain_hgt_stable(bool stable)
 #if HAL_NAVEKF3_AVAILABLE
     ekf3.EKF3.setTerrainHgtStable(stable);
 #endif
-}
-
-// returns true when the state estimates are significantly degraded by vibration
-bool AP_AHRS::is_vibration_affected() const
-{
-    switch (configured_ekf_type()) {
-#if HAL_NAVEKF3_AVAILABLE
-    case EKFType::THREE:
-        return ekf3.EKF3.isVibrationAffected();
-#endif
-#if AP_AHRS_DCM_ENABLED
-    case EKFType::DCM:
-#endif
-#if HAL_NAVEKF2_AVAILABLE
-    case EKFType::TWO:
-#endif
-#if AP_AHRS_SIM_ENABLED
-    case EKFType::SIM:
-#endif
-#if AP_AHRS_EXTERNAL_ENABLED
-    case EKFType::EXTERNAL:
-#endif
-        return false;
-    }
-    return false;
 }
 
 // get 1-sigma position and velocity uncertainty from the EKF state error covariance matrix P
@@ -2366,7 +2266,7 @@ bool AP_AHRS::get_location(Location &loc) const
 }
 
 // return a wind estimation vector in "wind" (m/s); returns false on failure
-bool AP_AHRS::wind_estimate(Vector3f &wind) const
+bool AP_AHRS::get_wind(Vector3f &wind) const
 {
     wind = active_estimates->wind;
     return active_estimates->wind_valid;

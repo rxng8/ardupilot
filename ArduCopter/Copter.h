@@ -151,6 +151,10 @@
 #include <AC_CustomControl/AC_CustomControl.h>                  // Custom control library
 #endif
 
+#if MODE_BRAKE_ENABLED && !MODE_ALTHOLD_ENABLED
+  #error Brake mode requires AltHold; disable MODE_BRAKE_ENABLED or enable MODE_ALTHOLD_ENABLED
+#endif
+
 #if AP_AVOIDANCE_ENABLED && !AP_FENCE_ENABLED
   #error AC_Avoidance relies on AP_FENCE_ENABLED which is disabled
 #endif
@@ -382,6 +386,12 @@ private:
 
     AirMode air_mode; // air mode is 0 = not-configured ; 1 = disabled; 2 = enabled;
     bool force_flying; // force flying is enabled when true;
+
+    // true if air-mode should be honoured; either it was turned on
+    // explicitly, or we armed with an arming switch which implies it:
+    bool air_mode_active() const {
+        return air_mode == AirMode::AIRMODE_ENABLED || ap.armed_with_airmode_switch;
+    }
 
     // This is the state of the flight control system
     // There are multiple states defined such as STABILIZE, ACRO,
@@ -1031,7 +1041,9 @@ private:
     ModeAcro mode_acro;
 #endif
 #endif
+#if MODE_ALTHOLD_ENABLED
     ModeAltHold mode_althold;
+#endif
 #if MODE_AUTO_ENABLED
     ModeAuto mode_auto;
 #endif

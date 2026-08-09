@@ -38,6 +38,11 @@ from vehicle_test_suite import WaitAndMaintainAttitude
 from vehicle_test_suite import WaitAndMaintainLocation
 from vehicle_test_suite import WaitModeTimeout
 
+# CAMERA_CAPTURE_STATUS.image_status is documented in the field description
+# rather than in an enumeration, so give the values we use names here
+CAMERA_IMAGE_STATUS_IDLE = 0
+CAMERA_IMAGE_STATUS_INTERVAL_IDLE = 2
+
 # get location of scripts
 testdir = os.path.dirname(os.path.realpath(__file__))
 SITL_START_LOCATION = mavutil.location(
@@ -107,18 +112,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
     def callisto_sitl_kwargs(self):
         """Returns kwargs for a SITL commandline to fly the Callisto. Wipes params."""
         return {
-            "defaults_filepath": self.model_defaults_filepath('Callisto'),
             "model": "octa-quad-cwx:@ROMFS/models/Callisto.json",
             "wipe": True
         }
-
-    def apply_defaultfile_parameters(self):
-        # Copter passes in a defaults_filepath in place of applying
-        # parameters afterwards.
-        pass
-
-    def defaults_filepath(self):
-        return self.model_defaults_filepath(self.frame)
 
     def wait_disarmed_default_wait_time(self):
         return 120
@@ -145,27 +141,44 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameter("DISARM_DELAY", delay)
 
     def takeoff(self,
-                alt_min=30,
+                altitude_min=30,
                 takeoff_throttle=1700,
                 require_absolute=True,
                 mode="STABILIZE",
                 timeout=120,
-                max_err=5,
+                altitude_max=None,
                 alt_minimum_duration=0,
                 ):
-        """Takeoff get to 30m altitude."""
+        """Takeoff to at least altitude_min metres above home.
+
+        Beware: in a manual-throttle mode such as STABILIZE the vehicle
+        climbs fast and can blow way past altitude_min before the
+        throttle is reduced, and unless altitude_max is supplied
+        nothing checks the overshoot.  If your test cares about the
+        altitude the takeoff finishes at, take off in GUIDED.
+        """
         self.progress("TAKEOFF")
         self.change_mode(mode)
         if not self.armed():
             self.wait_ready_to_arm(require_absolute=require_absolute, timeout=timeout)
             if mode != 'GUIDED':
+                # no RC fiddling in GUIDED; tests with a dead or
+                # ignored RC receiver rely on a GUIDED takeoff working
+                # without any RC input at all
                 self.zero_throttle()
             self.arm_vehicle()
         if mode == 'GUIDED':
-            self.user_takeoff(alt_min=alt_min, timeout=timeout, max_err=max_err)
+            max_err = 5
+            if altitude_max is not None:
+                max_err = altitude_max - altitude_min
+            self.user_takeoff(alt_min=altitude_min, timeout=timeout, max_err=max_err)
         else:
             self.set_rc(3, takeoff_throttle)
-        self.wait_altitude(alt_min-1, alt_min+max_err, relative=True, timeout=timeout, minimum_duration=alt_minimum_duration)
+        if altitude_max is None:
+            # no limit; a finite stand-in as wait_and_maintain does
+            # arithmetic on the bounds
+            altitude_max = 100000
+        self.wait_altitude(altitude_min-1, altitude_max, relative=True, timeout=timeout, minimum_duration=alt_minimum_duration)
         if mode != 'GUIDED':
             self.hover()
         self.progress("TAKEOFF COMPLETE")
@@ -208,7 +221,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             3: 1000,
             4: 1500,
         })
-        self.takeoff(alt_min=dAlt, mode='GUIDED')
+        self.takeoff(altitude_min=dAlt, mode='GUIDED')
         self.hover()
         self.change_mode("ALT_HOLD")
 
@@ -272,6 +285,237 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.change_alt(20)
 
         self.do_RTL()
+
+    def AirModeStabZeroThrottle(self):
+        '''test air-mode gives attitude control with the throttle stick at zero'''
+
+        def wait_throttle_output(minimum, maximum, **kwargs):
+            """wait for the throttle the autopilot is asking the motors for"""
+            self.wait_and_maintain_range(
+                value_name="ThrottleOutput",
+                minimum=minimum,
+                maximum=maximum,
+                current_value_getter=lambda: self.assert_receive_message('VFR_HUD').throttle,
+                **kwargs)
+
+        def assert_motor_outputs(minimum, maximum):
+            """check all four motor outputs are within the given PWM range"""
+            m = self.assert_receive_message('SERVO_OUTPUT_RAW')
+            values = [m.servo1_raw, m.servo2_raw, m.servo3_raw, m.servo4_raw]
+            self.progress("motor outputs: %s" % str(values))
+            for (i, value) in enumerate(values):
+                if value < minimum or value > maximum:
+                    raise NotAchievedException(
+                        "Motor %u output %u not in range %u-%u" %
+                        (i+1, value, minimum, maximum))
+
+        def airmode_flight(spin_arm_pwm):
+            """fly the scenario from the air-mode bug report: hover in
+            STABILIZE, check the pilot has roll control, then drop the
+            throttle to zero and check the vehicle still holds its attitude
+            against a disturbance all the way down"""
+
+            # take off in GUIDED, so that getting airborne does not depend on
+            # where the throttle stick is:
+            self.change_mode('GUIDED')
+            self.user_takeoff(alt_min=120, timeout=180)
+
+            self.progress("hover in STABILIZE with the throttle stick at mid")
+            self.change_mode('STABILIZE')
+            self.set_rc(3, 1500)
+            wait_throttle_output(20, 80, minimum_duration=1)
+            assert_motor_outputs(1300, 1900)
+
+            self.progress("check the pilot has roll control")
+            self.set_rc(1, 1000)
+            self.wait_roll(-30, 5, timeout=10)
+            self.set_rc(1, 1500)
+            self.wait_roll(0, 5, timeout=10)
+
+            self.progress("drop the throttle to zero; air-mode should keep the "
+                          "vehicle stabilised on the way down")
+            self.zero_throttle()
+            # the pilot is asking for nothing; anything the motors are given
+            # from here is air-mode keeping the vehicle stabilised:
+            wait_throttle_output(0, 1, minimum_duration=1)
+
+            # a sustained roll torque the attitude controller has to fight;
+            # with air-mode working the vehicle holds attitude, without it the
+            # vehicle tumbles:
+            self.set_parameters({
+                "SIM_TWIST_X": 40,  # rad/s/s
+                "SIM_TWIST_TIME": 3000,  # ms
+            })
+
+            max_roll = 0
+            tstart = self.get_sim_time()
+            while self.get_sim_time_cached() - tstart < 3:
+                m = self.assert_receive_message('GLOBAL_POSITION_INT')
+                if m.relative_alt * 0.001 < 40:
+                    # stop well before we reach the ground
+                    break
+                assert_motor_outputs(spin_arm_pwm + 10, 2000)
+                m = self.assert_receive_message('ATTITUDE')
+                roll = abs(math.degrees(m.roll))
+                max_roll = max(max_roll, roll)
+                if roll > 20:
+                    raise NotAchievedException(
+                        "Vehicle not stabilised at zero throttle (roll=%.1fdeg)" % roll)
+            self.progress("maximum roll excursion %.1fdeg" % max_roll)
+            if max_roll < 1:
+                # the vehicle did not feel the disturbance, so we have not
+                # actually tested anything:
+                raise NotAchievedException("Disturbance was not applied")
+
+            self.set_parameters({
+                "SIM_TWIST_X": 0,
+                "SIM_TWIST_TIME": 0,
+            })
+            self.disarm_vehicle(force=True)
+            self.zero_throttle()
+            self.reboot_sitl()
+
+        def arm_with_aux_switch():
+            """arm normally, then turn air-mode on with the AIRMODE aux switch"""
+            self.set_rc_from_map({7: 1000, 8: 1000})
+            self.wait_ready_to_arm()
+            self.zero_throttle()
+            self.arm_vehicle()
+            self.set_rc(8, 2000)
+
+        def arm_with_arming_switch():
+            """arm with the ARMDISARM_AIRMODE switch, which implies air-mode"""
+            self.set_rc_from_map({7: 1000, 8: 1000})
+            self.wait_ready_to_arm()
+            self.zero_throttle()
+            self.arm_motors_with_switch(7)
+
+        # ATC_THR_MIX_MAN defaults to the same value as ATC_THR_MIX_MIN, which
+        # leaves the attitude controller with almost no authority at zero
+        # throttle; air-mode users raise it:
+        self.set_parameters({
+            "ATC_THR_MIX_MAN": 0.5,
+            "RC7_OPTION": 154,  # ARMDISARM_AIRMODE
+            "RC8_OPTION": 84,   # AIRMODE
+        })
+        # motors idle at MOT_SPIN_ARM when the vehicle thinks it is not
+        # flying; the motor PWM range is the default 1000-2000:
+        spin_arm_pwm = 1000 + 1000 * self.get_parameter("MOT_SPIN_ARM")
+
+        for (description, arm_method) in [
+                ("the AIRMODE aux switch", arm_with_aux_switch),
+                ("arming with the ARMDISARM_AIRMODE switch", arm_with_arming_switch),
+        ]:
+            self.start_subtest("stabilisation at zero throttle with %s" % description)
+            arm_method()
+            airmode_flight(spin_arm_pwm)
+
+    def AirModeLanding(self):
+        '''test air-mode holds off landing detection rather than landing in mid-air'''
+
+        def land_detector_flight():
+            """the land detector must not decide the vehicle has landed just
+            because the throttle stick is at zero in air-mode"""
+
+            self.change_mode('GUIDED')
+            self.user_takeoff(alt_min=100, timeout=180)
+
+            # a strong updraft, so that with the throttle stick at zero the
+            # vehicle sits in equilibrium instead of falling.  That makes
+            # everything the land detector looks at - motors at their lower
+            # limit, no acceleration, no descent - say "landed", leaving the
+            # air-mode land-detector timeout as the only thing standing
+            # between us and a landing detected in mid-air:
+            self.set_parameters({
+                "SIM_WIND_T": 1,        # no gradient; we are a long way up
+                "SIM_WIND_DIR_Z": 90,   # straight up
+                "SIM_WIND_SPD": 16,     # a little over terminal velocity
+            })
+            # reach that equilibrium before taking manual control, so that the
+            # land detector's accelerating/descending checks are already
+            # satisfied and only its timeout is left to hold it off:
+            self.wait_climbrate(-1, 1, minimum_duration=2, timeout=30)
+
+            # the throttle stick has been at zero throughout, so the land
+            # detector can start counting the moment we take manual control:
+            self.zero_throttle()
+            self.change_mode('STABILIZE')
+
+            # air-mode delays landing detection, it does not prevent it.  If
+            # we never detect a landing then this scenario did not look like a
+            # landing at all and we have tested nothing:
+            self.context_set_message_rate_hz(
+                mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, 10)
+            self.wait_extended_sys_state(
+                mavutil.mavlink.MAV_VTOL_STATE_MC,
+                mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND,
+                timeout=10)
+            self.disarm_vehicle(force=True)
+
+            # find how long the land detector took to call this a landing.
+            # Use the onboard log; MAVLink timing is too coarse to tell
+            # LAND_DETECTOR_TRIGGER_SEC (1s) from
+            # LAND_AIRMODE_DETECTOR_TRIGGER_SEC (3s) apart:
+            stabilize_us = None
+            land_complete_us = None
+            dfreader = self.dfreader_for_current_onboard_log()
+            while True:
+                m = dfreader.recv_match(type=['MODE', 'EV'])
+                if m is None:
+                    break
+                if m.get_type() == 'MODE':
+                    if m.ModeNum == self.get_mode_from_mode_mapping('STABILIZE'):
+                        # start again from this mode change:
+                        stabilize_us = m.TimeUS
+                        land_complete_us = None
+                    continue
+                if (m.Id == 18 and  # LogEvent::LAND_COMPLETE
+                        stabilize_us is not None and
+                        land_complete_us is None):
+                    land_complete_us = m.TimeUS
+
+            if stabilize_us is None:
+                raise NotAchievedException("Did not find STABILIZE in the log")
+            if land_complete_us is None:
+                raise NotAchievedException("Did not find LAND_COMPLETE in the log")
+            delay = (land_complete_us - stabilize_us) * 1.0e-6
+            self.progress("landing detected %.2fs after taking manual control" % delay)
+            if delay < 2:
+                raise NotAchievedException(
+                    "Landing detected in mid-air %.2fs after taking manual "
+                    "control at zero throttle (air-mode should hold this off "
+                    "for %.0fs)" % (delay, 3))
+
+            self.zero_throttle()
+            self.reboot_sitl()
+
+        def arm_with_aux_switch():
+            """arm normally, then turn air-mode on with the AIRMODE aux switch"""
+            self.set_rc_from_map({7: 1000, 8: 1000})
+            self.wait_ready_to_arm()
+            self.zero_throttle()
+            self.arm_vehicle()
+            self.set_rc(8, 2000)
+
+        def arm_with_arming_switch():
+            """arm with the ARMDISARM_AIRMODE switch, which implies air-mode"""
+            self.set_rc_from_map({7: 1000, 8: 1000})
+            self.wait_ready_to_arm()
+            self.zero_throttle()
+            self.arm_motors_with_switch(7)
+
+        self.set_parameters({
+            "RC7_OPTION": 154,  # ARMDISARM_AIRMODE
+            "RC8_OPTION": 84,   # AIRMODE
+        })
+
+        for (description, arm_method) in [
+                ("the AIRMODE aux switch", arm_with_aux_switch),
+                ("arming with the ARMDISARM_AIRMODE switch", arm_with_arming_switch),
+        ]:
+            self.start_subtest("no mid-air landing detection with %s" % description)
+            arm_method()
+            land_detector_flight()
 
     def ModeAltHold(self):
         '''Test AltHold Mode'''
@@ -730,8 +974,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_circling_point_with_radius(
             loc, radius,
             epsilon=1,
-            min_circle_time=360,
-            timeout=400,
+            min_circle_time=120,
+            timeout=240,
             track_angle=False,
         )
         self.wait_altitude(99, 101, relative=True, timeout=240)
@@ -812,6 +1056,57 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 expected_groundspeed+0.1,
                 minimum_duration=10,
             )
+        self.do_RTL()
+
+    def CircleManualControlEntryLeft(self):
+        '''Circle orbits at the configured rate when entered holding roll stick left'''
+        # CIRCLE_OPTIONS defaults to 1 (manual control enabled); the pilot
+        # roll stick trims the orbit rate.  Holding the stick against the
+        # CIRCLE_RATE sign on entry used to pin the rate at zero so the
+        # vehicle never orbited at all.  The orbit must still reach the
+        # configured rate, and the pilot can then trim it down to a stop.
+        self.set_parameters({
+            "CIRCLE_RADIUS_M": 10,
+            "CIRCLE_RATE": 20,  # +ve, clockwise
+        })
+        expected_groundspeed = math.pi * 2 * 10 * (20 / 360.0)  # ~3.49m/s
+        self.takeoff(10, mode='LOITER')
+        self.hover()  # circle mode uses throttle input
+        self.set_rc(1, 1400)  # held left, against the CIRCLE_RATE sign
+        self.change_mode('CIRCLE')
+        self.wait_groundspeed(
+            expected_groundspeed - 0.5,
+            expected_groundspeed + 0.5,
+            minimum_duration=5,
+            timeout=30,
+        )
+        # the pilot can still trim the orbit rate down to a stop:
+        self.set_rc(1, 1100)
+        self.wait_groundspeed(0, 0.5, minimum_duration=2, timeout=60)
+        self.set_rc(1, 1500)
+        self.do_RTL()
+
+    def CircleManualControlEntryRight(self):
+        '''Circle orbits at the configured rate when entered holding roll stick right'''
+        # Holding the roll stick with the CIRCLE_RATE sign on entry used to
+        # leave the rate crawling up from zero instead of starting at the
+        # configured rate.  The orbit must reach the configured rate.
+        self.set_parameters({
+            "CIRCLE_RADIUS_M": 10,
+            "CIRCLE_RATE": 20,  # +ve, clockwise
+        })
+        expected_groundspeed = math.pi * 2 * 10 * (20 / 360.0)  # ~3.49m/s
+        self.takeoff(10, mode='LOITER')
+        self.hover()  # circle mode uses throttle input
+        self.set_rc(1, 1600)  # held right, with the CIRCLE_RATE sign
+        self.change_mode('CIRCLE')
+        self.wait_groundspeed(
+            expected_groundspeed - 0.5,
+            expected_groundspeed + 0.5,
+            minimum_duration=5,
+            timeout=30,
+        )
+        self.set_rc(1, 1500)
         self.do_RTL()
 
     # test copter-circle-speed lua script:
@@ -1091,10 +1386,12 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # to continue in guided. Verify no failsafe action takes place
         self.start_subtest("Radio failsafe with option to continue in guided mode: FS_THR_ENABLE=1 & FS_OPTIONS=4")
         self.set_parameter("MAV_GCS_SYSID", self.mav.source_system)
-        self.setGCSfailsafe(1)
         self.set_parameter('FS_THR_ENABLE', 1)
         self.set_parameter('FS_OPTIONS', 4)
         self.takeoffAndMoveAway()
+        # enable GCS failsafe only after the climb so the climb runs at
+        # full speedup; it only needs to be armed before SIM_RC_FAIL
+        self.setGCSfailsafe(1)
         self.change_mode("GUIDED")
         self.set_parameter("SIM_RC_FAIL", 1)
         self.delay_sim_time(5, reason="radio failsafe to not trigger")
@@ -1442,11 +1739,11 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.progress("Custom controller test complete")
 
     # Tests all actions and logic behind the battery failsafe
-    def BatteryFailsafe(self, timeout=300):
-        '''Fly Battery Failsafe'''
+    def batt_failsafe_init(self):
+        '''configure the common battery failsafe parameters shared by the
+        individual BatteryFailsafe* tests'''
         self.progress("Configure battery failsafe parameters")
         self.set_parameters({
-            'SIM_SPEEDUP': 4,
             'BATT_LOW_VOLT': 11.5,
             'BATT_CRT_VOLT': 10.1,
             'BATT_FS_LOW_ACT': 0,
@@ -1455,9 +1752,19 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             'SIM_BATT_VOLTAGE': 12.5,
         })
 
+    def clear_battery_failsafe(self):
+        '''clears battery failsafe (and resets % to 100)'''
+        self.run_cmd(
+            mavutil.mavlink.MAV_CMD_BATTERY_RESET,
+            p1=65535,   # battery mask
+            p2=100,      # percentage
+        )
+
+    def BatteryFailsafeDisabled(self):
+        '''Test that with battery failsafe disabled no action is taken'''
         # Trigger low battery condition with failsafe disabled. Verify
         # no action taken.
-        self.start_subtest("Batt failsafe disabled test")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         m = self.assert_receive_message('BATTERY_STATUS')
         if m.charge_state != mavutil.mavlink.MAV_BATTERY_CHARGE_STATE_OK:
@@ -1479,13 +1786,16 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.change_mode("RTL")
         self.wait_rtl_complete()
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
-        self.reboot_sitl()
-        self.end_subtest("Completed Batt failsafe disabled test")
+        # driving the battery critical latches the failsafe even with the
+        # failsafe actions disabled; clear it so a following test can arm
+        self.clear_battery_failsafe()
 
+    def BatteryFailsafeTwoStage(self):
+        '''Two stage battery failsafe test with RTL and Land'''
         # TWO STAGE BATTERY FAILSAFE: Trigger low battery condition,
         # then critical battery condition. Verify RTL and Land actions
         # complete.
-        self.start_subtest("Two stage battery failsafe test with RTL and Land")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.delay_sim_time(3, reason="vehicle to move away")
         self.set_parameters({
@@ -1501,13 +1811,14 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_mode("LAND")
         self.wait_landed_and_disarmed()
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
-        self.reboot_sitl()
-        self.end_subtest("Completed two stage battery failsafe test with RTL and Land")
+        self.clear_battery_failsafe()
 
+    def BatteryFailsafeTwoStageSmartRTL(self):
+        '''Two stage battery failsafe test with SmartRTL'''
         # TWO STAGE BATTERY FAILSAFE: Trigger low battery condition,
         # then critical battery condition. Verify both SmartRTL
         # actions complete
-        self.start_subtest("Two stage battery failsafe test with SmartRTL")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.set_parameter('BATT_FS_LOW_ACT', 3)
         self.set_parameter('BATT_FS_CRT_ACT', 4)
@@ -1522,13 +1833,14 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_mode("SMART_RTL")
         self.wait_disarmed()
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
-        self.reboot_sitl()
-        self.end_subtest("Completed two stage battery failsafe test with SmartRTL")
+        self.clear_battery_failsafe()
 
+    def BatteryFailsafeOptionsContinueLanding(self):
+        '''Battery failsafe with FS_OPTIONS set to continue landing'''
         # Trigger low battery condition in land mode with FS_OPTIONS
         # set to allow land mode to continue. Verify landing completes
         # uninterrupted.
-        self.start_subtest("Battery failsafe with FS_OPTIONS set to continue landing")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.set_parameter('FS_OPTIONS', 8)
         self.change_mode("LAND")
@@ -1539,13 +1851,14 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_mode("LAND")
         self.wait_landed_and_disarmed()
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
-        self.reboot_sitl()
-        self.end_subtest("Completed battery failsafe with FS_OPTIONS set to continue landing")
+        self.clear_battery_failsafe()
 
+    def BatteryFailsafeCriticalLanding(self):
+        '''Battery failsafe critical landing not interrupted by RC failure'''
         # Trigger a critical battery condition, which triggers a land
         # mode failsafe. Trigger an RC failure. Verify the RC failsafe
         # is prevented from stopping the low battery landing.
-        self.start_subtest("Battery failsafe critical landing")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway(100, 50)
         self.set_parameters({
             'FS_OPTIONS': 0,
@@ -1564,12 +1877,12 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_landed_and_disarmed()
         self.set_parameter('SIM_BATT_VOLTAGE', 12.5)
         self.set_parameter("SIM_RC_FAIL", 0)
-        self.reboot_sitl()
-        self.end_subtest("Completed battery failsafe critical landing")
+        self.reboot_sitl()  # reset to starting position
 
+    def BatteryFailsafeBrakeLand(self):
+        '''Battery failsafe brake/land action triggers BRAKE'''
         # Trigger low battery condition with failsafe set to brake/land
-        self.start_subtest("Battery failsafe brake/land")
-        self.context_push()
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.set_parameter('BATT_FS_LOW_ACT', 7)
         self.delay_sim_time(10, reason="vehicle to move away")
@@ -1581,12 +1894,11 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_mode('BRAKE')
         self.set_rc(1, 1500)
         self.disarm_vehicle(force=True)
-        self.context_pop()
-        self.reboot_sitl()
-        self.end_subtest("Completed brake/land failsafe test")
+        self.reboot_sitl()  # reset to starting position
 
-        self.start_subtest("Battery failsafe brake/land - land")
-        self.context_push()
+    def BatteryFailsafeBrakeLandNoGPS(self):
+        '''Battery failsafe brake/land action falls back to LAND without GPS'''
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.set_parameter('BATT_FS_LOW_ACT', 7)
         self.set_parameter('SIM_GPS1_ENABLE', 0)
@@ -1595,21 +1907,19 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_statustext("Battery 1 is low", timeout=60)
         self.wait_mode('LAND')
         self.disarm_vehicle(force=True)
-        self.reboot_sitl()
-        self.context_pop()
-        self.end_subtest("Completed brake/land failsafe test")
+        self.reboot_sitl()  # reset to starting position
 
+    def BatteryFailsafeTerminate(self):
+        '''Battery failsafe terminate action - copter disarms and crashes'''
         # Trigger low battery condition with failsafe set to terminate. Copter will disarm and crash.
-        self.start_subtest("Battery failsafe terminate")
+        self.batt_failsafe_init()
         self.takeoffAndMoveAway()
         self.set_parameter('BATT_FS_LOW_ACT', 5)
         self.delay_sim_time(10, reason="vehicle to move away")
         self.set_parameter('SIM_BATT_VOLTAGE', 11.4)
         self.wait_statustext("Battery 1 is low", timeout=60)
         self.wait_disarmed()
-        self.end_subtest("Completed terminate failsafe test")
-
-        self.progress("All Battery failsafe tests complete")
+        self.reboot_sitl()  # Copter should start at home
 
     def BatteryMissing(self):
         ''' Test battery health pre-arm and missing failsafe'''
@@ -1623,15 +1933,13 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             'BATT_VOLT_PIN': -1,
         })
 
-        self.drain_mav()
-
         # Battery should go unhealthy immediately
         self.assert_prearm_failure("Battery 1 unhealthy", other_prearm_failures_fatal=False)
 
         # Return monitor to health
         self.context_pop()
-        self.context_push()
 
+        self.context_push()
         self.wait_ready_to_arm()
 
         # take off and then trigger in flight
@@ -1643,10 +1951,10 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # Should trigger missing failsafe
         self.wait_statustext("Battery 1 is missing")
 
-        # Done, reset params and reboot to clear failsafe
+        # Done, reset params and clear failsafe
         self.land_and_disarm()
         self.context_pop()
-        self.reboot_sitl()
+        self.clear_battery_failsafe()
 
     def VibrationFailsafe(self):
         '''Test Vibration Failsafe'''
@@ -2601,7 +2909,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.change_mode("GUIDED")
         self.wait_ready_to_arm()
         self.arm_vehicle()
-        self.takeoff(alt_min=15, mode="GUIDED")
+        self.takeoff(altitude_min=15, mode="GUIDED")
 
         # Check fence is enabled
         self.assert_fence_enabled()
@@ -2639,7 +2947,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.wait_ready_to_arm()
         self.arm_vehicle()
-        self.takeoff(alt_min=15, mode="GUIDED")
+        self.takeoff(altitude_min=15, mode="GUIDED")
 
         # Check fence is enabled
         self.assert_fence_enabled()
@@ -2666,10 +2974,17 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
     def FenceMargin(self, timeout=180):
         '''Test warning on crossing fence margin'''
         # enable fence, disable avoidance
+        # margin must be large enough that the circle margin ring
+        # (FENCE_RADIUS-FENCE_MARGIN from home) is reached before the
+        # polygon edge (~117m from home on this test's track) so both
+        # margins are breached simultaneously before any fence is: the
+        # combined "Circle and Polygon fences in ..." warning this test
+        # expects is only emitted while both margin breaches are active,
+        # and an actual fence breach clears that fence's margin state
         self.set_parameters({
             "FENCE_ENABLE": 1,
             "FENCE_TYPE": 6,    # polygon and circle fences
-            "FENCE_MARGIN" : 30,
+            "FENCE_MARGIN" : 45,
             "FENCE_RADIUS" : 150,
             "AVOID_ENABLE": 0,
             "FENCE_OPTIONS": 4
@@ -3004,9 +3319,15 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # re-arming is problematic because the GPS is glitching!
         self.reboot_sitl()
 
-    def GPSGlitchLoiter2(self):
-        """test vehicle handles GPS glitch (aka EKF Reset) without twitching"""
+    def gps_glitch_loiter2_for_ekf_type(self, active_type):
+        '''run the GPSGlitchLoiter2 sequence with the given EKF active'''
         self.context_push()
+        self.set_parameters({
+            "AHRS_EKF_TYPE": active_type,
+            "EK2_ENABLE": 1,
+            "EK3_ENABLE": 1,
+        })
+        self.reboot_sitl()
         self.takeoff(10, mode="LOITER")
 
         # wait for vehicle to level
@@ -3025,10 +3346,18 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             if abs(roll_deg) > 2 or abs(pitch_deg) > 2:
                 raise NotAchievedException("fly_gps_glitch_loiter_test2 failed, roll or pitch moved during GPS glitch")
 
-        # RTL, remove glitch and reboot sitl
+        # RTL; the context pop removes the glitch and reboots
         self.do_RTL(alt_max=2)
         self.context_pop()
-        self.reboot_sitl()
+
+    def GPSGlitchLoiter2(self):
+        """test vehicle handles GPS glitch (aka EKF Reset) without twitching"""
+        # both enabled filters see glitch-induced position resets; the
+        # vehicle response only depends on the active filter, so fly
+        # once with each:
+        for active_type in 3, 2:
+            self.start_subtest("active EKF type %u" % active_type)
+            self.gps_glitch_loiter2_for_ekf_type(active_type)
 
     def GPSGlitchAuto(self, timeout=180):
         '''fly mission and test reaction to gps glitch'''
@@ -3356,6 +3685,29 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # next test...
         self.reboot_sitl()
 
+    def CompassHealthArming(self):
+        '''compass-health arming check honours the ARMING_CHECK compass bit'''
+        self.wait_ready_to_arm()
+        # fail all compasses; the shared pre-arm compass check must
+        # refuse arming while compass checking is enabled:
+        self.set_parameters({
+            "SIM_MAG1_FAIL": 1,
+            "SIM_MAG2_FAIL": 1,
+            "SIM_MAG3_FAIL": 1,
+        })
+        self.assert_prearm_failure("Compass 1 not healthy",
+                                   other_prearm_failures_fatal=False)
+        # an actual arm attempt must also be refused:
+        self.assert_arm_failure("Compass 1 not healthy")
+        # with the compass arming check disabled the vehicle must arm
+        # despite the unhealthy compass; an unconditional arm-time
+        # check (removed along with ALLOW_ARM_NO_COMPASS) used to
+        # refuse this:
+        self.set_parameter("ARMING_SKIPCHK", 1 << 2)
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.disarm_vehicle()
+
     def MagFail(self):
         '''test failover of compass in EKF'''
         # we want both EK2 and EK3
@@ -3466,7 +3818,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.change_alt(pre_flip_altitude_m, threshold_below_m=1.0, threshold_above_m=1.0)
 
         acceptable_altitude_loss_during_flip_m = 10.0
-        self.takeoff(pre_flip_altitude_m)
+        self.takeoff(pre_flip_altitude_m, mode='GUIDED')
+        self.hover()
         self.change_mode('ALT_HOLD')
 
         get_ready_for_flip()
@@ -3699,7 +4052,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.reboot_sitl()
 
         # we can't takeoff in loiter as we need flow healthy
-        self.takeoff(alt_min=5, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1800)
+        self.takeoff(altitude_min=5, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1800)
         self.change_mode('LOITER')
 
         # speed should be limited to <10m/s
@@ -3762,7 +4115,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # arm and take off directly in Loiter: this is the path that matters -
         # Loiter requires_position(), and arming exercises the arm-time
         # compass-health gate while the compass is not the EKF yaw source.
-        self.takeoff(alt_min=10, mode='LOITER', require_absolute=False, takeoff_throttle=1800)
+        self.takeoff(altitude_min=10, mode='LOITER', require_absolute=False, takeoff_throttle=1800)
 
         # confirm Loiter stays engaged and armed (no EKF failsafe / mode
         # revert). A lat/lon position-hold check is not used: with no GPS the
@@ -3847,7 +4200,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.wait_ready_to_arm(require_absolute=False, timeout=120)
         # flow is not healthy stationary, so climb in ALT_HOLD to a low hover
-        self.takeoff(alt_min=2, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1700)
+        self.takeoff(altitude_min=2, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1700)
         self.change_mode('LOITER')
         self.delay_sim_time(5, "let altitude settle")
 
@@ -4083,7 +4436,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # set these parameters so they get reverted at the end of the test:
         self.set_parameters(ogains)
 
-        self.takeoff(10)
+        self.takeoff(10, mode='GUIDED')
+        self.hover()
+        self.change_mode('STABILIZE')
 
         tstart = self.get_sim_time()
 
@@ -4128,7 +4483,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # set these parameters so they get reverted at the end of the test:
         self.set_parameters(ogains)
 
-        self.takeoff(10)
+        self.takeoff(10, mode='GUIDED')
+        self.hover()
+        self.change_mode('STABILIZE')
 
         tstart = self.get_sim_time()
 
@@ -4734,16 +5091,26 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.drain_mav()
             self.context_collect('STATUSTEXT')
             self.reboot_sitl()
-            gps1_det_text = None
-            gps2_det_text = None
-            try:
-                gps1_det_text = self.wait_text("GPS 1: specified as DroneCAN.*", regex=True, check_context=True)
-            except AutoTestTimeoutException:
-                pass
-            try:
-                gps2_det_text = self.wait_text("GPS 2: specified as DroneCAN.*", regex=True, check_context=True)
-            except AutoTestTimeoutException:
-                pass
+            # detection statustexts for both GPSs are emitted together
+            # shortly after boot.  Wait for any GPS expected to be
+            # present first, so boot latency is absorbed by that wait;
+            # a GPS expected to be absent then only needs a short
+            # timeout, as a (wrongly) emitted detection statustext
+            # would already be in the collected context.
+            gps_det_texts = {}
+            for instance in sorted((1, 2), key=lambda i: case[1 + i] == 0):
+                timeout = 20 if case[1 + instance] != 0 else 5
+                try:
+                    gps_det_texts[instance] = self.wait_text(
+                        "GPS %u: specified as DroneCAN.*" % instance,
+                        regex=True,
+                        check_context=True,
+                        timeout=timeout,
+                    )
+                except AutoTestTimeoutException:
+                    gps_det_texts[instance] = None
+            gps1_det_text = gps_det_texts[1]
+            gps2_det_text = gps_det_texts[2]
 
             self.context_stop_collecting('STATUSTEXT')
             self.change_mode('LOITER')
@@ -5243,7 +5610,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.mav.mav.system_time_send(int(time.time() * 1000000), 0)
         self.set_origin(old_pos)
 
-        self.takeoff(alt_min=5, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1800)
+        self.takeoff(altitude_min=5, mode='ALT_HOLD', require_absolute=False, takeoff_throttle=1800)
         self.change_mode('LAND')
         # TODO: something more elaborate here - EKF will only aid
         # relative position
@@ -5589,7 +5956,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         start_speed_ms = self.get_parameter('WP_SPD')
 
-        self.takeoff(20)
+        self.takeoff(20, mode='GUIDED')
         self.change_mode('AUTO')
         self.wait_groundspeed(start_speed_ms-1, start_speed_ms+1, minimum_duration=10)
 
@@ -5614,7 +5981,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         minimum_duration = 5
 
-        self.takeoff(20)
+        self.takeoff(20, mode='GUIDED')
         self.change_mode('AUTO')
         self.wait_climbrate(start_speed_ms-1, start_speed_ms+1, minimum_duration=minimum_duration)
 
@@ -5894,12 +6261,16 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             "SERVO9_FUNCTION": 27,
             "SIM_PARA_ENABLE": 1,
             "SIM_PARA_PIN": 9,
+            # not left over from a previous pass through this test;
+            # RC9 low would otherwise disable the chute at each boot:
+            "RC9_OPTION": 0,
         })
 
         self.progress("Test triggering parachute in mission")
         self.load_mission("copter_parachute_mission.txt")
         self.change_mode('LOITER')
         self.wait_ready_to_arm()
+        self.zero_throttle()
         self.arm_vehicle()
         self.change_mode('AUTO')
         self.set_rc(3, 1600)
@@ -5909,11 +6280,15 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.progress("Test triggering with mavlink message")
         self.takeoff(20)
+        self.context_collect('STATUSTEXT')
         command(
             mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
             p1=2, # release
         )
-        self.wait_statustext('BANG', timeout=60)
+        # check_context: the BANG can arrive while command() is still
+        # draining messages awaiting its COMMAND_ACK
+        self.wait_statustext('BANG', timeout=60, check_context=True)
+        self.context_stop_collecting('STATUSTEXT')
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
 
@@ -5976,11 +6351,15 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
             p1=mavutil.mavlink.PARACHUTE_ENABLE,
         )
+        self.context_collect('STATUSTEXT')
         command(
             mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
             p1=mavutil.mavlink.PARACHUTE_RELEASE,
         )
-        self.wait_statustext('BANG! Parachute deployed', timeout=2)
+        # check_context: the BANG can arrive while command() is still
+        # draining messages awaiting its COMMAND_ACK
+        self.wait_statustext('BANG!  Parachute deployed', timeout=2, check_context=True)
+        self.context_stop_collecting('STATUSTEXT')
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
 
@@ -5989,14 +6368,22 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.takeoff(40)
         self.set_rc(9, 1500)
         self.set_parameters({
-            "SIM_ENGINE_FAIL": 1 << 1, # motor 2
+            # both front motors; a single failed motor is compensated
+            # well enough that the parachute's loss-of-control check
+            # (sustained >30deg tilt error while descending) only
+            # marginally triggers, and a failed diagonal pair leaves a
+            # torque-balanced flat spin which never triggers it
+            "SIM_ENGINE_FAIL": (1 << 0) | (1 << 2), # motors 1 and 3
         })
-        self.wait_statustext('BANG! Parachute deployed', timeout=60)
+        self.wait_statustext('BANG!  Parachute deployed', timeout=60)
         self.set_rc(9, 1000)
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
         self.context_pop()
 
+        # context so SIM_ENGINE_FAIL is reverted; leaving it set leaks
+        # a dead motor into everything which follows
+        self.context_push()
         self.progress("Crashing with 3pos switch in disable position")
         loiter_alt = 10
         self.takeoff(loiter_alt, mode='LOITER')
@@ -6016,6 +6403,19 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_rc(9, 1000)
         self.disarm_vehicle(force=True)
         self.reboot_sitl()
+        self.context_pop()
+
+        # the parachute aux function has changed CHUTE_ENABLED's
+        # value in RAM without saving it, so at this point the
+        # parameter's value (0) does not match storage (1).  Set it
+        # back to the known value this test runs with; the test
+        # framework's end-of-test parameter revert then sees the
+        # change it expects and restores the default properly, rather
+        # than skipping the apparently-already-reverted parameter and
+        # leaving a stale 1 in storage for the context-pop reboot to
+        # resurrect - which would fail every subsequent test with
+        # "PreArm: Chute has no relay".
+        self.set_parameter("CHUTE_ENABLED", 1)
 
     def Parachute(self):
         '''Test Parachute Functionality'''
@@ -6299,7 +6699,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameter("RC8_OPTION", 61)
         self.set_parameter("LOIT_OPTIONS", 0)
 
-        self.takeoff(alt_min=5, mode='LOITER')
+        self.takeoff(altitude_min=5, mode='LOITER')
 
         ZIGZAG = 24
         j = 0
@@ -7769,6 +8169,101 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                         (expected_cap_flags, m.flags))
             return
 
+    def wait_camera_initialised(self, instance, timeout=30):
+        '''wait for the camera backend for instance (1-based) to report a
+        vendor name in CAMERA_INFORMATION; it only does that once the camera
+        has completed its handshake with the backend'''
+        tstart = self.get_sim_time()
+        while True:
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException(
+                    "Camera instance %u did not initialise" % instance)
+            try:
+                m = self.poll_message('CAMERA_INFORMATION', timeout=5, p2=instance)
+            except NotAchievedException:
+                continue
+            if bytes(m.vendor_name).split(b'\x00')[0]:
+                return
+
+    def camera_settings_for_compid(self, compid):
+        '''return most recently collected CAMERA_SETTINGS from compid, if any'''
+        ret = None
+        for m in self.context_collection('CAMERA_SETTINGS'):
+            if m.get_srcComponent() == compid:
+                ret = m
+        return ret
+
+    def wait_camera_settings(self, wants, timeout=30):
+        '''wait for collected CAMERA_SETTINGS to show each (compid, zoom,
+        focus) in wants; a wanted value of None is not checked.  The cameras
+        emit CAMERA_SETTINGS in response to zoom and focus commands, so this
+        returns as soon as those responses arrive'''
+        tstart = self.get_sim_time()
+        while True:
+            unmet = []
+            for (compid, want_zoom, want_focus) in wants:
+                m = self.camera_settings_for_compid(compid)
+                if m is None:
+                    unmet.append("compid %u: no CAMERA_SETTINGS" % compid)
+                    continue
+                if want_zoom is not None and abs(m.zoomLevel - want_zoom) > 0.5:
+                    unmet.append("compid %u: zoom want=%f got=%f" %
+                                 (compid, want_zoom, m.zoomLevel))
+                if want_focus is not None and abs(m.focusLevel - want_focus) > 0.5:
+                    unmet.append("compid %u: focus want=%f got=%f" %
+                                 (compid, want_focus, m.focusLevel))
+            if len(unmet) == 0:
+                return
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException("; ".join(unmet))
+            self.mav.recv_match(type='CAMERA_SETTINGS', blocking=True, timeout=0.1)
+
+    def camera_capture_statuses(self, count, timeout=10):
+        '''request CAMERA_CAPTURE_STATUS and return the image_status from each
+        of the count messages which come back.  One message is sent per
+        camera and they all come from the autopilot, so which camera each
+        describes cannot be told apart by the receiver'''
+        self.context_clear_collection('CAMERA_CAPTURE_STATUS')
+        self.send_poll_message('CAMERA_CAPTURE_STATUS')
+        tstart = self.get_sim_time()
+        while True:
+            collection = self.context_collection('CAMERA_CAPTURE_STATUS')
+            if len(collection) >= count:
+                return [m.image_status for m in collection]
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException(
+                    "Got %u CAMERA_CAPTURE_STATUS, wanted %u" %
+                    (len(collection), count))
+            self.mav.recv_match(type='CAMERA_CAPTURE_STATUS', blocking=True, timeout=0.1)
+
+    def camera_feedback_img_idx(self, cam_idx):
+        '''return most recently collected img_idx for cam_idx, or None.
+        CAMERA_FEEDBACK is emitted for every camera whenever any camera
+        triggers, so the most recent message from a camera carries that
+        camera's current count of images taken since boot'''
+        ret = None
+        for m in self.context_collection('CAMERA_FEEDBACK'):
+            if m.cam_idx == cam_idx:
+                ret = m.img_idx
+        return ret
+
+    def wait_camera_img_idx(self, wants, timeout=30):
+        '''wait for collected CAMERA_FEEDBACK to show each (cam_idx, img_idx)
+        in wants'''
+        tstart = self.get_sim_time()
+        while True:
+            unmet = []
+            for (cam_idx, want_img_idx) in wants:
+                got = self.camera_feedback_img_idx(cam_idx)
+                if got != want_img_idx:
+                    unmet.append("cam_idx %u: img_idx want=%s got=%s" %
+                                 (cam_idx, want_img_idx, got))
+            if len(unmet) == 0:
+                return
+            if self.get_sim_time_cached() - tstart > timeout:
+                raise NotAchievedException("; ".join(unmet))
+            self.mav.recv_match(type='CAMERA_FEEDBACK', blocking=True, timeout=0.1)
+
     def MountSiyiZT30(self):
         '''test Siyi ZT30 gimbal using SIM_Siyi_ZT30 simulator'''
         self.set_parameters({
@@ -7812,6 +8307,41 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # until AP_Mount_Topotek::send_target_angles enforces the limit.
         self.mount_test_body(pitch_rc_neutral=1818, do_rate_tests=False,
                              constrain_sysid_target=False)
+
+    def MountTopotekNetwork(self):
+        '''test Topotek gimbal connected via a network port rather than a serial port'''
+        self.set_parameters({
+            "MNT1_TYPE": 12,      # Topotek
+            "CAM1_TYPE": 4,       # Mount
+            "NET_ENABLE": 1,
+            "NET_P1_TYPE": 3,     # TCP client
+            "NET_P1_PROTOCOL": 8,  # gimbal
+            "NET_P1_IP0": 127,
+            "NET_P1_IP1": 0,
+            "NET_P1_IP2": 0,
+            "NET_P1_IP3": 1,
+            "NET_P1_PORT": 15005,
+        })
+        # the simulated gimbal listens on a TCP socket rather than
+        # being attached to one of the autopilot's serial ports:
+        self.customise_SITL_commandline(["--net-device=topotek:15005"])
+        # the gimbal sends its replies out of the interface named in the
+        # address field of our requests, so this only works if the
+        # driver tells the gimbal we are talking to it over the network
+        self.mount_check_camera_information(
+            "Topotek", "SIM_TP",
+            expected_fw_version=1,
+            expected_cap_flags=0x6C3,
+        )
+        # command an angle and check the gimbal reports reaching it,
+        # which requires traffic in both directions:
+        self.set_mount_mode(mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING)
+        self.run_cmd(
+            mavutil.mavlink.MAV_CMD_DO_MOUNT_CONTROL,
+            p1=-30,  # pitch angle in degrees
+            p7=mavutil.mavlink.MAV_MOUNT_MODE_MAVLINK_TARGETING,
+        )
+        self.wait_mount_roll_pitch_yaw_deg(p=-30)
 
     def MountViewPro(self):
         '''test Viewpro gimbal using SIM_Viewpro simulator'''
@@ -7867,7 +8397,11 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             "--serial5=sim:avt_cm62_gimbal:",
             "--serial6=sim:avt_cm62_gimbal:",
         ])
-        self.delay_sim_time(12, "wait for MAVLink camera backends to initialise")
+        for instance in 1, 2:
+            self.wait_camera_initialised(instance)
+        self.context_collect('CAMERA_CAPTURE_STATUS')
+        self.context_collect('CAMERA_FEEDBACK')
+        self.context_collect('CAMERA_SETTINGS')
 
     def MountAVTCM62Dual(self):
         '''test two simultaneous MAVLink (Gimbal Protocol v2) gimbals using
@@ -7875,16 +8409,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self._setup_avt_cm62_dual()
 
         # note that CAMERA_FEEDBACK uses instance numbers starting from 0
-        trigger_counts = {}
-
-        def trig_counter(mav, m):
-            if m.get_type() != 'CAMERA_FEEDBACK':
-                return
-            if m.cam_idx not in trigger_counts:
-                trigger_counts[m.cam_idx] = 0
-            trigger_counts[m.cam_idx] += 1
-
-        self.install_message_hook_context(trig_counter)
+        want_img_idx = [1, 1]
         self.progress("Test triggering of the two cameras")
         self.run_cmd_int(
             mavutil.mavlink.MAV_CMD_DO_SET_CAM_TRIGG_DIST,
@@ -7892,37 +8417,19 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             p3=1,   # trigger instantly
             p4=0,   # 0 means trigger for all cameras
         )
-        self.delay_sim_time(2, "allow CAMERA_FEEDBACK to come through")
-        for cam in 0, 1:
-            if cam not in trigger_counts:
-                raise NotAchievedException(f"Did not see trigger for cam{cam}")
-            if trigger_counts[cam] != 1:
-                raise NotAchievedException(f"Incorrect trigger count for cam{cam}")
+        self.wait_camera_img_idx(list(enumerate(want_img_idx)))
 
         for cam in 0, 1:
             self.progress(f"Test triggering of the just cam{cam}")
-            trigger_counts = {}
             self.run_cmd_int(
                 mavutil.mavlink.MAV_CMD_DO_SET_CAM_TRIGG_DIST,
                 p1=10,  # trigger distance
                 p3=1,   # trigger instantly
                 p4=cam+1,
             )
-            self.delay_sim_time(2, "allow CAMERA_FEEDBACK to come through")
-            if cam not in trigger_counts:
-                raise NotAchievedException(f"Did not see trigger for cam{cam}")
-            if trigger_counts[cam] != 1:
-                raise NotAchievedException(f"Incorrect trigger count for cam{cam}")
-
-        # Test per-camera zoom and focus levels
-        camera_settings_by_compid = {}
-
-        def camera_settings_hook(mav, m):
-            if m.get_type() != 'CAMERA_SETTINGS':
-                return
-            camera_settings_by_compid[m.get_srcComponent()] = m
-
-        self.install_message_hook_context(camera_settings_hook)
+            # the count for the other camera must not move
+            want_img_idx[cam] += 1
+            self.wait_camera_img_idx(list(enumerate(want_img_idx)))
 
         cam1_compid = mavutil.mavlink.MAV_COMP_ID_CAMERA
         cam2_compid = mavutil.mavlink.MAV_COMP_ID_CAMERA + 1  # MAV_COMP_ID_CAMERA2
@@ -7940,18 +8447,12 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             p2=70,  # 70%
             p3=2,   # camera instance 2
         )
-        self.delay_sim_time(2, "allow CAMERA_SETTINGS to come through")
-        for compid, want_zoom in [(cam1_compid, 30), (cam2_compid, 70)]:
-            if compid not in camera_settings_by_compid:
-                raise NotAchievedException(
-                    f"Did not see CAMERA_SETTINGS from compid {compid}")
-            got = camera_settings_by_compid[compid].zoomLevel
-            if abs(got - want_zoom) > 0.5:
-                raise NotAchievedException(
-                    f"compid {compid} zoom wrong: want={want_zoom} got={got}")
+        self.wait_camera_settings([
+            (cam1_compid, 30, None),
+            (cam2_compid, 70, None),
+        ])
 
         self.progress("Test setting different focus levels on each camera")
-        camera_settings_by_compid.clear()
         self.run_cmd_int(
             mavutil.mavlink.MAV_CMD_SET_CAMERA_FOCUS,
             p1=mavutil.mavlink.FOCUS_TYPE_RANGE,
@@ -7964,37 +8465,56 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             p2=80,  # 80%
             p3=2,   # camera instance 2
         )
-        self.delay_sim_time(2, "allow CAMERA_SETTINGS to come through")
-        for compid, want_focus in [(cam1_compid, 20), (cam2_compid, 80)]:
-            if compid not in camera_settings_by_compid:
-                raise NotAchievedException(
-                    f"Did not see CAMERA_SETTINGS from compid {compid}")
-            got = camera_settings_by_compid[compid].focusLevel
-            if abs(got - want_focus) > 0.5:
-                raise NotAchievedException(
-                    f"compid {compid} focus wrong: want={want_focus} got={got}")
+        # the zoom levels set above must be unchanged by the focus commands
+        self.wait_camera_settings([
+            (cam1_compid, 30, 20),
+            (cam2_compid, 70, 80),
+        ])
+
+        self.progress("Test setting zoom and focus on all cameras at once")
+        self.run_cmd_int(
+            mavutil.mavlink.MAV_CMD_SET_CAMERA_ZOOM,
+            p1=mavutil.mavlink.ZOOM_TYPE_RANGE,
+            p2=50,  # 50%
+            p3=0,   # 0 means all cameras
+        )
+        self.run_cmd_int(
+            mavutil.mavlink.MAV_CMD_SET_CAMERA_FOCUS,
+            p1=mavutil.mavlink.FOCUS_TYPE_RANGE,
+            p2=60,  # 60%
+            p3=0,   # 0 means all cameras
+        )
+        self.wait_camera_settings([
+            (cam1_compid, 50, 60),
+            (cam2_compid, 50, 60),
+        ])
 
     def MountAVTCM62DualMission(self):
-        '''test dual AVT CM62 cameras with zoom and focus controlled via
-        mission items (MAV_CMD_SET_CAMERA_ZOOM and MAV_CMD_SET_CAMERA_FOCUS)'''
+        '''test dual AVT CM62 cameras with photo capture, zoom and focus
+        controlled via mission items'''
         self._setup_avt_cm62_dual()
 
         cam1_compid = mavutil.mavlink.MAV_COMP_ID_CAMERA
         cam2_compid = mavutil.mavlink.MAV_COMP_ID_CAMERA + 1  # MAV_COMP_ID_CAMERA2
 
-        camera_settings_by_compid = {}
-
-        def camera_settings_hook(mav, m):
-            if m.get_type() != 'CAMERA_SETTINGS':
-                return
-            camera_settings_by_compid[m.get_srcComponent()] = m
-
-        self.install_message_hook_context(camera_settings_hook)
-
         self.set_parameter("AUTO_OPTIONS", 3)
 
         mission_items = [
             (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            self.create_MISSION_ITEM_INT(
+                mavutil.mavlink.MAV_CMD_IMAGE_START_CAPTURE,
+                p1=1,    # camera instance 1
+                p2=0,    # interval (0 = single shot)
+                p3=1,    # total images = 1
+                autocontinue=1,
+            ),
+            self.create_MISSION_ITEM_INT(
+                mavutil.mavlink.MAV_CMD_IMAGE_START_CAPTURE,
+                p1=2,    # camera instance 2
+                p2=1,    # interval (s)
+                p3=2,    # total images = 2
+                autocontinue=1,
+            ),
             self.create_MISSION_ITEM_INT(
                 mavutil.mavlink.MAV_CMD_SET_CAMERA_ZOOM,
                 p1=mavutil.mavlink.ZOOM_TYPE_RANGE,
@@ -8023,32 +8543,63 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 p3=2,    # camera instance 2
                 autocontinue=1,
             ),
+            self.create_MISSION_ITEM_INT(
+                mavutil.mavlink.MAV_CMD_IMAGE_START_CAPTURE,
+                p1=1,    # camera instance 1
+                p2=1,    # interval (s)
+                p3=0,    # total images = 0 (capture until stopped)
+                autocontinue=1,
+            ),
+            # the do-commands above all run while the takeoff is the current
+            # mission item, so camera 1 captures for the duration of the
+            # climb; the stop below runs once the waypoint becomes current
             (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 30, 0, 20),
+            self.create_MISSION_ITEM_INT(
+                mavutil.mavlink.MAV_CMD_IMAGE_STOP_CAPTURE,
+                p1=1,    # camera instance 1
+                autocontinue=1,
+            ),
             (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
         ]
 
-        self.fly_simple_relhome_mission(mission_items)
-        self.delay_sim_time(2, "allow CAMERA_SETTINGS to come through after mission")
+        self.start_flying_simple_relhome_mission(mission_items)
 
-        self.progress("Verify per-camera zoom levels set by mission items")
-        for compid, want_zoom in [(cam1_compid, 25), (cam2_compid, 75)]:
-            if compid not in camera_settings_by_compid:
-                raise NotAchievedException(
-                    f"Did not see CAMERA_SETTINGS from compid {compid}")
-            got = camera_settings_by_compid[compid].zoomLevel
-            if abs(got - want_zoom) > 0.5:
-                raise NotAchievedException(
-                    f"compid {compid} zoom wrong: want={want_zoom} got={got}")
+        self.progress("Verify CAMERA_CAPTURE_STATUS reports the interval capture")
+        # wait for camera 2 to finish the images it was asked for, leaving
+        # camera 1 as the only one with an interval set for the rest of the
+        # climb
+        self.wait_camera_img_idx([(1, 2)])
+        got = sorted(self.camera_capture_statuses(2))
+        if got != [CAMERA_IMAGE_STATUS_IDLE, CAMERA_IMAGE_STATUS_INTERVAL_IDLE]:
+            raise NotAchievedException(
+                f"Wanted exactly one camera capturing on an interval: {got}")
 
-        self.progress("Verify per-camera focus levels set by mission items")
-        for compid, want_focus in [(cam1_compid, 40), (cam2_compid, 80)]:
-            if compid not in camera_settings_by_compid:
-                raise NotAchievedException(
-                    f"Did not see CAMERA_SETTINGS from compid {compid}")
-            got = camera_settings_by_compid[compid].focusLevel
-            if abs(got - want_focus) > 0.5:
-                raise NotAchievedException(
-                    f"compid {compid} focus wrong: want={want_focus} got={got}")
+        # the return-to-launch is the last item, so home is its sequence
+        # number; by the time it is current camera 1 has been stopped
+        self.wait_current_waypoint(len(mission_items))
+        self.progress("Verify camera 1 captured images until stopped")
+        img_idx_at_stop = self.camera_feedback_img_idx(0)
+        if img_idx_at_stop is None or img_idx_at_stop <= 1:
+            raise NotAchievedException(
+                f"cam_idx 0 did not capture until stopped: got={img_idx_at_stop}")
+
+        # the descent and landing which follow give camera 1 plenty of time
+        # to take more images if IMAGE_STOP_CAPTURE did not stop it
+        self.wait_disarmed()
+
+        self.progress("Verify per-camera shot counts from mission items")
+        self.wait_camera_img_idx([(0, img_idx_at_stop), (1, 2)])
+
+        self.progress("Verify CAMERA_CAPTURE_STATUS reports no interval capture")
+        got = self.camera_capture_statuses(2)
+        if got != [CAMERA_IMAGE_STATUS_IDLE, CAMERA_IMAGE_STATUS_IDLE]:
+            raise NotAchievedException(f"Camera still has an interval set: {got}")
+
+        self.progress("Verify per-camera zoom and focus set by mission items")
+        self.wait_camera_settings([
+            (cam1_compid, 25, 40),
+            (cam2_compid, 75, 80),
+        ])
 
     def assert_mount_rpy(self, r, p, y, tolerance=1):
         '''assert mount atttiude in degrees'''
@@ -8422,14 +8973,14 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.progress("Vehicle returned")
 
     def hover_and_check_matched_frequency_with_fft_and_psd(self, dblevel=-15, minhz=200, maxhz=300, peakhz=None,
-                                                           reverse=None, takeoff=True, instance=0):
+                                                           reverse=None, takeoff=True, instance=0, hover_time=15):
         '''Takeoff and hover, checking the noise against the provided db level and returning psd'''
         # find a motor peak
         if takeoff:
             self.takeoff(10, mode="ALT_HOLD")
             self.wait_altitude(8, 12, relative=True, minimum_duration=10)
 
-        tstart, tend, hover_throttle = self.hover_for_interval(15)
+        tstart, tend, hover_throttle = self.hover_for_interval(hover_time)
         self.do_RTL()
 
         psd = self.mavfft_fttd(1, instance, tstart * 1.0e6, tend * 1.0e6)
@@ -8454,11 +9005,11 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         return freq, hover_throttle, peakdb, psd
 
     def hover_and_check_matched_frequency_with_fft(self, dblevel=-15, minhz=200, maxhz=300, peakhz=None,
-                                                   reverse=None, takeoff=True, instance=0):
+                                                   reverse=None, takeoff=True, instance=0, hover_time=15):
         '''Takeoff and hover, checking the noise against the provided db level and returning peak db'''
         freq, hover_throttle, peakdb, psd = \
             self.hover_and_check_matched_frequency_with_fft_and_psd(dblevel, minhz,
-                                                                    maxhz, peakhz, reverse, takeoff, instance)
+                                                                    maxhz, peakhz, reverse, takeoff, instance, hover_time)
         return freq, hover_throttle, peakdb
 
     def get_average_esc_frequency(self):
@@ -8627,11 +9178,16 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameter("INS_HNTCH_OPTS", 0)
         self.customise_SITL_commandline(
             [],
-            defaults_filepath=','.join(self.model_defaults_filepath("octa")),
             model="octa"
         )
+        # search from 150Hz rather than 50Hz: the octa motor fundamental the
+        # notch targets is ~190-200Hz, but the high INS_GYRO_FILTER used here
+        # lets the rate loop sustain a closed-loop oscillation near half the
+        # motor frequency (~90Hz).  That subharmonic is real vehicle motion the
+        # harmonic notch is not meant to remove, so don't let it fail the notch
+        # check.  Hover longer too, to settle the Welch FFT estimate.
         freq, hover_throttle, peakdb1, psd = \
-            self.hover_and_check_matched_frequency_with_fft_and_psd(-10, 50, 320, reverse=True, instance=2)
+            self.hover_and_check_matched_frequency_with_fft_and_psd(-10, 150, 320, reverse=True, instance=2, hover_time=30)
         # find the noise at the motor frequency
         esc_hz = self.get_average_esc_frequency()
         esc_peakdb1 = psd["X"][int(esc_hz)]
@@ -8642,7 +9198,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.reboot_sitl()
 
         freq, hover_throttle, peakdb2, psd = \
-            self.hover_and_check_matched_frequency_with_fft_and_psd(-15, 50, 320, reverse=True, instance=2)
+            self.hover_and_check_matched_frequency_with_fft_and_psd(-15, 150, 320, reverse=True, instance=2, hover_time=30)
         # find the noise at the motor frequency
         esc_hz = self.get_average_esc_frequency()
         esc_peakdb2 = psd["X"][int(esc_hz)]
@@ -9798,8 +10354,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         '''test MANUAL_CONTROL mavlink message'''
         self.set_parameter("MAV_GCS_SYSID", self.mav.source_system)
 
+        self.takeoff(10, mode='GUIDED')
+        self.hover()
         self.change_mode('STABILIZE')
-        self.takeoff(10)
 
         tstart = self.get_sim_time_cached()
         want_pitch_degrees = -12
@@ -11338,9 +11895,21 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.wait_statustext("requested state is not RUN", timeout=200)
 
         self.set_rc(gen_ctrl_ch, 1500) # remember this is a switch position - idle
+
+        # ask for a throttle whose steady-state RPM is inside the band we
+        # check for below.  At 50% throttle the engine settles at 4080rpm,
+        # so the only time it is in-band is while it is spinning up - a
+        # race we lose when the engine hasn't wound down far enough while
+        # stopped:
+        pwm_for_thirty_percent_throttle = int(rc_min + int((rc_max-rc_min)*0.3))
+        self.progress("Using PWM of %u for 30 percent throttle" % pwm_for_thirty_percent_throttle)
+        self.set_rc(loweheiser_man_throt_ch, pwm_for_thirty_percent_throttle)
+
         self.set_rc(loweheiser_man_start_ch, 2000)
         self.wait_generator_speed_and_state(2000, 3000, mavutil.mavlink.MAV_GENERATOR_STATUS_FLAG_IDLE)
         self.set_rc(loweheiser_man_start_ch, 1000)
+
+        self.set_rc(loweheiser_man_throt_ch, pwm_for_fifty_percent_throttle)
 
         self.set_rc(gen_ctrl_ch, 2000) # remember this is a switch position - run
 
@@ -11666,7 +12235,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
     def fly_rangefinder_drivers_fly(self, rangefinders):
         '''ensure rangefinder gives height-above-ground'''
         expected_alt = 5
-        self.takeoff(expected_alt, mode='GUIDED', alt_minimum_duration=5)
+        self.takeoff(expected_alt, mode='GUIDED', altitude_max=expected_alt+5, alt_minimum_duration=5)
         ds = self.assert_receive_message("DISTANCE_SENSOR")
         gpi = self.assert_receive_message('GLOBAL_POSITION_INT')
         delta = abs(ds.current_distance*0.01 - gpi.relative_alt/1000.0)
@@ -11937,15 +12506,19 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 raise NotAchievedException("Did not get %s" % want)
             still_want.remove(m.get_type())
 
-    def GSF_reset(self):
-        '''test the Gaussian Sum filter based Emergency reset'''
+    def gsf_reset_for_ekf_type(self, active_type):
+        '''run the GSF emergency-reset sequence with the given EKF active'''
         self.context_push()
         self.set_parameters({
+            "AHRS_EKF_TYPE": active_type,
+            "EK2_ENABLE": 1,
+            "EK3_ENABLE": 1,
             "COMPASS_ORIENT": 4,    # yaw 180
             "COMPASS_USE2": 0,      # disable backup compasses to avoid pre-arm failures
             "COMPASS_USE3": 0,
         })
         self.reboot_sitl()
+        self.context_collect('STATUSTEXT')
         self.change_mode('GUIDED')
         self.wait_ready_to_arm()
 
@@ -11959,7 +12532,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.user_takeoff(alt_min=expected_alt)
 
         # watch for emergency yaw reset
-        self.wait_text("EKF3 IMU. emergency yaw reset", timeout=5, regex=True)
+        self.wait_statustext("EKF%u IMU. emergency yaw reset" % active_type,
+                             timeout=10, regex=True, check_context=True)
 
         # record how far vehicle flew off
         endpos = self.assert_receive_message('LOCAL_POSITION_NED')
@@ -11970,12 +12544,22 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.do_RTL()
         self.context_pop()
-        self.reboot_sitl()
 
         # ensure vehicle did not fly too far
         dist_m_max = 8
         if dist_m > dist_m_max:
             raise NotAchievedException("GSF reset failed, vehicle flew too far (%f > %f)" % (dist_m, dist_m_max))
+
+    def GSF_reset(self):
+        '''test the Gaussian Sum filter based Emergency reset'''
+        # the emergency yaw reset request is routed by AHRS to the
+        # active estimator only, so fly once with each filter active;
+        # the other filter remains enabled throughout.  Each iteration
+        # gets its own context so that its statustext collection does
+        # not see the previous iteration's messages.
+        for active_type in 2, 3:
+            self.start_subtest("active EKF type %u" % active_type)
+            self.gsf_reset_for_ekf_type(active_type)
 
     def EKFBootstrapReset(self):
         '''verify EKF reset aux switch is disarmed-only and preserves origin'''
@@ -12242,28 +12826,56 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.context_pop()
         self.reboot_sitl()
 
-    def EKFYawResetLogged(self):
-        '''in-filter EKF yaw resets must propagate through AHRS and be logged'''
+    def SIMCompare(self):
+        '''compare logged EKF2 and EKF3 estimates against simulator truth'''
+        self.set_parameters({
+            'AHRS_EKF_TYPE': 3,
+            'EK2_ENABLE': 1,
+            'EK3_ENABLE': 1,
+        })
+        self.reboot_sitl()
+
+        # fly a mixture of translation, climb, descent and yaw to give
+        # the estimators something to track:
+        self.change_mode('GUIDED')
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.user_takeoff(alt_min=20)
+        self.guided_achieve_heading(135)
+        self.fly_guided_move_local(30, 40, 15)
+        self.guided_achieve_heading(270)
+        self.fly_guided_move_local(0, 0, 25)
+        self.do_RTL()
+
+        self.assert_ekfs_match_sim_state()
+
+    def ekf_yaw_reset_logged_for_ekf_type(self, active_type):
+        '''fly an in-filter yaw reset with the given EKF active'''
         self.context_push()
         self.set_parameters({
+            "AHRS_EKF_TYPE": active_type,
+            "EK2_ENABLE": 1,
+            "EK3_ENABLE": 1,
             "COMPASS_ORIENT": 4,    # yaw 180
             "COMPASS_USE2": 0,      # disable backup compasses to avoid pre-arm failures
             "COMPASS_USE3": 0,
         })
         self.reboot_sitl()
+        self.context_collect('STATUSTEXT')
         self.change_mode('GUIDED')
         self.wait_ready_to_arm()
         self.arm_vehicle()
         self.user_takeoff(alt_min=5)
 
-        # the mis-oriented compass causes an in-filter emergency yaw
-        # reset shortly after takeoff:
-        self.wait_text("EKF3 IMU. emergency yaw reset", timeout=5, regex=True)
+        # the mis-oriented compass causes an in-filter emergency
+        # yaw reset shortly after takeoff:
+        self.wait_statustext("EKF%u IMU. emergency yaw reset" % active_type,
+                             timeout=10, regex=True, check_context=True)
         self.delay_sim_time(5, reason="let the event reach the log")
         self.do_RTL()
 
-        # the EKF's internal yaw reset must be noticed by AHRS, which
-        # logs an EKF_YAW_RESET event:
+        # the active EKF's internal yaw reset must be noticed by
+        # AHRS, which logs an EKF_YAW_RESET event:
         dfreader = self.dfreader_for_current_onboard_log()
         armed = False
         while True:
@@ -12277,7 +12889,17 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.progress("Found EKF_YAW_RESET event in log")
 
         self.context_pop()
-        self.reboot_sitl()
+
+    def EKFYawResetLogged(self):
+        '''in-filter EKF yaw resets must propagate through AHRS and be logged'''
+        # the emergency yaw reset request is routed by AHRS to the
+        # active estimator only, so fly once with each filter active;
+        # the other filter remains enabled throughout.  Each iteration
+        # gets its own context so that its statustext collection does
+        # not see the previous iteration's messages.
+        for active_type in 2, 3:
+            self.start_subtest("active EKF type %u" % active_type)
+            self.ekf_yaw_reset_logged_for_ekf_type(active_type)
 
     def FlyRangeFinderMAVlink(self):
         '''fly mavlink-connected rangefinder'''
@@ -12515,7 +13137,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         if sqalt is None:
             takeoff_alt = maxalt
         self.context_set_message_rate_hz('RANGEFINDER', self.sitl_streamrate())
-        self.takeoff(takeoff_alt, mode='GUIDED', timeout=240, max_err=0.5)
+        self.takeoff(takeoff_alt, mode='GUIDED', timeout=240, altitude_max=takeoff_alt+0.5)
         self.assert_rangefinder_distance_between(takeoff_alt-5, takeoff_alt+5)
 
         self.wait_rangefinder_distance(takeoff_alt-5, takeoff_alt+5)
@@ -13511,7 +14133,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             [],
             **self.callisto_sitl_kwargs()
         )
-        self.takeoff(10)
+        self.takeoff(10, mode='GUIDED')
         self.do_RTL()
 
     def FlyEachFrame(self):
@@ -13541,16 +14163,12 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 self.progress("Actually, no I'm not - it is an external simulation")
                 continue
             model = frame_bits.get("model", frame)
-            defaults = self.model_defaults_filepath(frame)
-            if not isinstance(defaults, list):
-                defaults = [defaults]
             self.context_push()
             frame_script = frame_bits.get('frame_example_script', None)
             if frame_script is not None:
                 self.install_example_script_context(frame_script)
             self.customise_SITL_commandline(
                 [],
-                defaults_filepath=defaults,
                 model=model,
                 wipe=True,
             )
@@ -13809,6 +14427,25 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.change_mode("LAND")
         self.wait_landed_and_disarmed()
 
+    def MissionRTLAltFinalContinue(self):
+        '''ensure AUTO mission can continue past a NAV_RETURN_TO_LAUNCH item
+        even if the vehicle holds altitude at RTL_ALT_FINAL_M'''
+        target_alt = 5
+        self.set_parameters({
+            "AUTO_OPTIONS": 3,
+            "RTL_ALT_FINAL_M": target_alt,
+        })
+        self.start_flying_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_LAND, 0, 0, 0),
+        ])
+
+        # ensure the vehicle reaches the LAND command instead of getting stuck at RTL
+        self.wait_current_waypoint(4, timeout=60)
+        self.wait_disarmed()
+
     def SMART_RTL(self):
         '''Check SMART_RTL'''
         self.progress("arm the vehicle and takeoff in Guided")
@@ -13951,7 +14588,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                                        (duration, want))
 
         self.start_subtest("takeoffExpected should be false very soon after we launch into the air")
-        self.takeoff(mode='ALT_HOLD', alt_min=5)
+        self.takeoff(mode='ALT_HOLD', altitude_min=5)
         self.change_mode('LAND')
         self.wait_disarmed()
         durations = self.get_takeoffexpected_durations_from_current_onboard_log(ignore_multi=True)
@@ -14196,7 +14833,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
     def SMART_RTL_Repeat(self):
         '''Test whether Smart RTL catches the repeat'''
-        self.takeoff(alt_min=10, mode='GUIDED')
+        self.takeoff(altitude_min=10, mode='GUIDED')
         self.hover()
         self.change_mode("CIRCLE")
         self.delay_sim_time(1300, reason="SmartRTL to fill breadcrumb buffer")
@@ -14773,7 +15410,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameters({
             'RALLY_INCL_HOME': 0,
         })
-        self.takeoff(10)
+        self.takeoff(10, mode='GUIDED')
+        self.hover()
         self.change_mode('RTL')
         self.wait_location(rally_loc, height_accuracy=None)
         self.assert_altitude(rally_alt, relative=True)
@@ -15023,7 +15661,14 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
     def tests1c(self):
         '''return list of all tests'''
         ret = ([
-             self.BatteryFailsafe,
+             self.BatteryFailsafeDisabled,
+             self.BatteryFailsafeTwoStage,
+             self.BatteryFailsafeTwoStageSmartRTL,
+             self.BatteryFailsafeOptionsContinueLanding,
+             self.BatteryFailsafeCriticalLanding,
+             self.BatteryFailsafeBrakeLand,
+             self.BatteryFailsafeBrakeLandNoGPS,
+             self.BatteryFailsafeTerminate,
              self.BatteryMissing,
              self.VibrationFailsafe,
              self.EK3AccelBias,
@@ -15069,12 +15714,15 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
              self.GPSGlitchLoiter2,
              self.GPSGlitchAuto,
              self.GPSFixTypes,
+             self.AirModeStabZeroThrottle,
+             self.AirModeLanding,
              self.ModeAltHold,
              self.ModeLoiter,
              self.SimpleMode,
              self.SuperSimpleCircle,
              self.ModeCircle,
              self.MagFail,
+             self.CompassHealthArming,
              self.OpticalFlow,
              self.OpticalFlowLocation,
              self.OpticalFlowLimits,
@@ -15153,6 +15801,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
              self.MAV_CMD_NAV_VTOL_LAND,
              self.clear_roi,
              self.ReadOnlyDefaults,
+             self.DefaultsCommaList,
              self.FenceRelativePreArms,
              self.FenceRelativeToHomeMaxAlt,
              self.FenceRelativeToHomeMinAlt,
@@ -15223,7 +15872,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         # install get-target-location-mount-backend.lua script
         self.install_example_script_context('get-target-location-mount-backend.lua')
         self.reboot_sitl()
-        self.takeoff(50)
+        self.takeoff(50, mode='GUIDED')
 
         self.context_collect("STATUSTEXT")
 
@@ -15480,7 +16129,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         })
         self.reboot_sitl()
         self.wait_ready_to_arm()
-        self.takeoff(alt_min=20, mode='LOITER')
+        self.takeoff(altitude_min=20, mode='LOITER')
         self.do_RTL()
         self.context_pop()
         self.reboot_sitl()
@@ -15761,7 +16410,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
     def BrakeZ(self):
         '''check jerk limit correct in Brake mode'''
-        self.set_parameter('PSC_JERK_D', 3)
+        self.set_parameter('PSC_D_JERK', 3)
         self.takeoff(50, mode='GUIDED')
         vx, vy, vz_up = (0, 0, -1)
         self.test_guided_local_velocity_target(vx=vx, vy=vy, vz_up=vz_up, timeout=10)
@@ -16161,8 +16810,10 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             minimum_duration=20,
         )
         self.wait_groundspeed(0, 0.5, timeout=15)
-        self.set_rc(2, 1500)
-        self.do_RTL()
+        # a forced reboot rather than an RTL: the RTL (at speedup 1)
+        # proves nothing further, and set_home requires a post-test
+        # reboot anyway
+        self.reboot_sitl(force=True)
 
     def MAV_CMD_SET_EKF_SOURCE_SET(self):
         '''test setting of source sets using mavlink command'''
@@ -16454,8 +17105,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_rc(1, 1500)
         self.set_rc(2, 1500)
 
-        dfreader = self.dfreader_for_current_onboard_log()
         self.do_RTL()
+
+        dfreader = self.dfreader_for_current_onboard_log()
 
         for i in range(len(gpis)):
             gpi = gpis[i]
@@ -17322,6 +17974,22 @@ RTL_ALT_M 111
         self.assert_parameter_value("RTL_ALT_M", 111)
         self.assert_parameter_value('RTL_ALT_FINAL_M', 101)
 
+    def DefaultsCommaList(self):
+        '''test that --defaults accepts multiple comma-separated files, with later files overriding earlier ones'''
+        f1 = tempfile.NamedTemporaryFile(mode='w', suffix='.parm', delete=False)
+        f1.write("RTL_ALT_M 500\nDISARM_DELAY 20\n")
+        f1.close()
+
+        f2 = tempfile.NamedTemporaryFile(mode='w', suffix='.parm', delete=False)
+        f2.write("RTL_ALT_M 750\n")
+        f2.close()
+
+        self.customise_SITL_commandline([], defaults_filepath=[f1.name, f2.name])
+
+        # f2 overrides RTL_ALT_M; DISARM_DELAY comes only from f1
+        self.assert_parameter_value("RTL_ALT_M", 750)
+        self.assert_parameter_value("DISARM_DELAY", 20)
+
     def ScriptingFlipMode(self):
         '''test adding custom mode from scripting'''
         # Really it would be nice to check for the AVAILABLE_MODES message, but pymavlink does not understand them yet.
@@ -17402,6 +18070,62 @@ RTL_ALT_M 111
         self.arm_vehicle()
         self.wait_waypoint(num_wp-1, num_wp-1, timeout=120)
         self.wait_disarmed(timeout=60)
+
+    def ScriptingOSD(self):
+        '''test OSD scripting with waypoint mission - requires SFML OSD'''
+        # This test requires SITL to be built with SFML support:
+        #   ./waf configure --board sitl --enable-sfml --sitl-osd
+        # Without SFML, the OSD scripting bindings return nil and scripts fail.
+
+        # Check if OSD is compiled in by looking for OSD_TYPE parameter
+        try:
+            self.get_parameter("OSD_TYPE", timeout=5)
+        except NotAchievedException:
+            self.progress("OSD not compiled in, skipping test")
+            return
+
+        self.context_collect('STATUSTEXT')
+
+        # Install the OSD example script
+        self.install_example_script_context('osd.lua')
+
+        # When built with --sitl-osd, OSD_TYPE defaults to 2 and the OSD backend
+        # is initialized at process start. The OSD backend cannot be created
+        # after boot (OSD_TYPE requires process restart), so if not built with
+        # --sitl-osd, the test will detect this and skip gracefully.
+        # SIM_SPEEDUP=5 makes the OSD window visible longer for visual testing.
+        self.set_parameters({
+            "SCR_ENABLE": 1,
+            "OSD_TYPE": 2,  # SITL OSD (requires --sitl-osd at configure time)
+            "SIM_SPEEDUP": 5,  # Slow enough to see the OSD
+        })
+        self.reboot_sitl()
+
+        # The script prints "osd not available" when no OSD backend is present
+        # (SITL built without --sitl-osd); detect that and skip gracefully.
+        try:
+            self.wait_statustext("osd not available", timeout=5, check_context=True)
+            self.progress("OSD scripting not functional (SFML not enabled), skipping test")
+            return
+        except AutoTestTimeoutException:
+            # no error message means the OSD is working
+            pass
+
+        # AUTO_OPTIONS=3 allows arming and taking off in AUTO
+        self.set_parameter("AUTO_OPTIONS", 3)
+
+        # fly a mission while the script draws waypoint info to the OSD
+        # (type, north_offset_m, east_offset_m, alt_m)
+        self.start_flying_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 50, 0, 20),    # 50m North
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 50, 50, 20),   # 50m North, 50m East
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 0, 50, 20),    # 50m East
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+
+        # Wait for mission to complete (land and disarm)
+        self.wait_disarmed(timeout=180)
 
     def RTLYaw(self):
         '''test that vehicle yaws to original heading on RTL'''
@@ -18519,6 +19243,8 @@ return update, 1000
             self.CompassReordering,
             self.SixCompassCalibrationAndReordering,
             self.CRSF,
+            self.MSPVTXConfig,
+            self.MSPDisplayPortVTXConfig,
             self.MotorTest,
             self.AltEstimation,
             self.EK3_NoGPSLeakWhenNotSource,
@@ -18530,9 +19256,11 @@ return update, 1000
             self.AHRSSwitchBackendPositionNEReset,
             self.AHRSSwitchBackendYawReset,
             self.EK3SrcSwitchPosDownReset,
+            self.SIMCompare,
             self.EKFYawResetLogged,
             self.AP_Avoidance,
             self.RTL_ALT_FINAL_M,
+            self.MissionRTLAltFinalContinue,
             self.SMART_RTL,
             self.MAV_CMD_DO_SET_HOME_bad_location,
             self.SMART_RTL_EnterLeave,
@@ -18587,9 +19315,12 @@ return update, 1000
             self.MountSolo,
             self.MountSiyiZT30,
             self.CircleSpeed,
+            self.CircleManualControlEntryLeft,
+            self.CircleManualControlEntryRight,
             self.LuaCopterCircleSpeed,
             self.TakeoffWithLocation,
             self.MountTopotek,
+            self.MountTopotekNetwork,
             self.MountViewPro,
             self.MountAVTCM62,
             self.MountAVTCM62Dual,
@@ -18661,6 +19392,7 @@ return update, 1000
             self.RC_OPTIONS_1_FS_THR_ENABLE_0,
             self.ScriptingFlyVelocity,
             self.Scripting6DoFMotors,
+            self.ScriptingOSD,
             self.EK3_EXT_NAV_vel_without_vert,
             self.CompassLearnCopyFromEKF,
             self.AHRSAutoTrim,
@@ -18734,7 +19466,7 @@ return update, 1000
         if m.flags & expected_flags != expected_flags:
             raise NotAchievedException(
                 f"Expected flags 0x{expected_flags:x}, got 0x{m.flags:x}")
-        self.takeoff(alt_min=10, mode="LOITER")
+        self.takeoff(altitude_min=10, mode="LOITER")
         self.assert_received_message_field_values("UTM_GLOBAL_POSITION", {
             "flight_state": mavutil.mavlink.UTM_FLIGHT_STATE_AIRBORNE,
         }, poll=True)
@@ -18912,13 +19644,13 @@ return update, 1000
 
     def disabled_tests(self):
         return {
-            "Parachute": "See https://github.com/ArduPilot/ardupilot/issues/4702",
             "GroundEffectCompensation_takeOffExpected": "Flapping",
             "GroundEffectCompensation_touchDownExpected": "Flapping",
             "FlyMissionTwice": "See https://github.com/ArduPilot/ardupilot/pull/18561",
             "SMART_RTL_EnterLeave": "Causes a panic",
             "SMART_RTL_Repeat": "Currently fails due to issue with loop detection",
             "RTLStoppingDistanceSpeed": "Currently fails due to vehicle going off-course",
+            "ScriptingOSD": "Requires SFML which is not available in CI",
         }
 
 
